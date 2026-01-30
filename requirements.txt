@@ -1,0 +1,11 @@
+# Install PyTorch ROCm first:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+
+transformers>=4.51.3
+accelerate
+gradio>=4.0
+matplotlib
+numpy
+
+# Do NOT install mamba-ssm or causal-conv1d
+# (forces slow PyTorch path that exposes all SSM intermediates for extraction)
