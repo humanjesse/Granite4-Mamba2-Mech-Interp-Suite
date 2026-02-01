@@ -20,6 +20,12 @@ from src.extraction.activation_diff import compute_activation_diff
 from src.visualization.activation_diff_viz import create_activation_diff_summary, format_diff_info
 from src.extraction.multistep_generator import run_multistep_generation
 from src.visualization.multistep_viz import create_multistep_dashboard, format_multistep_info
+from src.extraction.causal_intervention import CausalInterventionEngine, InterventionType
+from src.visualization.intervention_viz import (
+    create_layer_sweep_dashboard,
+    create_full_sweep_dashboard,
+    format_intervention_info,
+)
 
 # Global state
 MODEL = None
@@ -28,11 +34,13 @@ EXTRACTOR = None
 ARCH_MAP = None
 CACHE = {}
 MULTISTEP_CACHE = {}
+INTERVENTION_ENGINE = None
+INTERVENTION_CACHE = {}
 
 
 def initialize():
     """Load model and set up extractor."""
-    global MODEL, TOKENIZER, EXTRACTOR, ARCH_MAP
+    global MODEL, TOKENIZER, EXTRACTOR, ARCH_MAP, INTERVENTION_ENGINE
 
     # Use CPU by default — .to(cuda) hangs intermittently on gfx1151.
     # 350M model runs fine on CPU. Set DEVICE=cuda to force GPU.
@@ -41,6 +49,7 @@ def initialize():
     MODEL, TOKENIZER, device = load_model(device=device)
     ARCH_MAP = ArchitectureMap(MODEL.config)
     EXTRACTOR = GraniteAttentionExtractor(MODEL, TOKENIZER, device=device)
+    INTERVENTION_ENGINE = CausalInterventionEngine(MODEL, TOKENIZER, ARCH_MAP, device=device)
     print(f"Model loaded. {ARCH_MAP.summary()}")
 
 
@@ -249,6 +258,59 @@ def multistep_view(prompt, max_tokens, step_idx, head_agg):
     return fig, info, gr.update(maximum=num_steps - 1, value=step_idx)
 
 
+def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_token,
+                      intervention_type, sweep_mode):
+    """Run causal intervention experiment and visualize results."""
+    corrupted_prompt = corrupted_prompt or ""
+    correct_token = correct_token or ""
+    incorrect_token = incorrect_token or ""
+    intervention_type = intervention_type or InterventionType.ACTIVATION_PATCH.value
+    sweep_mode = sweep_mode or "Layer Sweep (all positions)"
+
+    if not corrupted_prompt or not corrupted_prompt.strip():
+        return None, "Please enter a corrupted prompt."
+    if not correct_token or not correct_token.strip():
+        return None, "Please enter a correct token (the answer the clean prompt should produce)."
+    if not incorrect_token or not incorrect_token.strip():
+        return None, "Please enter an incorrect token (the answer the corrupted prompt produces)."
+
+    int_type = InterventionType(intervention_type)
+
+    cache_key = (
+        clean_prompt.strip(), corrupted_prompt.strip(),
+        correct_token.strip(), incorrect_token.strip(),
+        intervention_type, sweep_mode,
+    )
+
+    if cache_key in INTERVENTION_CACHE:
+        sweep_result = INTERVENTION_CACHE[cache_key]
+    else:
+        if sweep_mode == "Full Position × Layer Sweep":
+            sweep_result = INTERVENTION_ENGINE.sweep_positions_and_layers(
+                clean_prompt, corrupted_prompt,
+                correct_token.strip(), incorrect_token.strip(),
+                int_type,
+            )
+        else:
+            # Both "Layer Sweep (all positions)" and "Single Position × All Layers"
+            # use sweep_layers — the difference is the positions argument
+            positions = None  # all positions by default
+            sweep_result = INTERVENTION_ENGINE.sweep_layers(
+                clean_prompt, corrupted_prompt,
+                correct_token.strip(), incorrect_token.strip(),
+                int_type, positions=positions,
+            )
+        INTERVENTION_CACHE[cache_key] = sweep_result
+
+    if sweep_result.recovery_matrix.dim() == 1:
+        fig = create_layer_sweep_dashboard(sweep_result, ARCH_MAP)
+    else:
+        fig = create_full_sweep_dashboard(sweep_result, ARCH_MAP)
+
+    info = format_intervention_info(sweep_result)
+    return fig, info
+
+
 def get_layer_type_label(layer_idx):
     """Return the layer type for display."""
     layer_idx = int(layer_idx)
@@ -306,13 +368,13 @@ SSM layers interpretable alongside standard Transformer attention.
                 )
 
                 prompt_b_input = gr.Textbox(
-                    label="Comparison Prompt (for Activation Diff)",
-                    placeholder="Enter a second prompt to compare against...",
+                    label="Comparison / Corrupted Prompt",
+                    placeholder="Enter a second prompt (for Activation Diff or Causal Intervention)...",
                     lines=2,
                 )
 
                 view_mode = gr.Radio(
-                    choices=["Single Layer", "Mamba vs Transformer", "All Layers", "Logit Lens", "Neuron Activation", "Activation Diff", "Multi-Step Generation"],
+                    choices=["Single Layer", "Mamba vs Transformer", "All Layers", "Logit Lens", "Neuron Activation", "Activation Diff", "Causal Intervention", "Multi-Step Generation"],
                     value="Single Layer",
                     label="View Mode",
                 )
@@ -360,6 +422,63 @@ SSM layers interpretable alongside standard Transformer attention.
                     visible=False,
                 )
 
+                # Causal Intervention controls
+                correct_token_input = gr.Textbox(
+                    label="Correct Token",
+                    placeholder='e.g. "Paris" — the answer the clean prompt should produce',
+                    visible=False,
+                )
+                incorrect_token_input = gr.Textbox(
+                    label="Incorrect Token",
+                    placeholder='e.g. "Warsaw" — the answer the corrupted prompt produces',
+                    visible=False,
+                )
+                token_info_display = gr.Textbox(
+                    label="Token Resolution",
+                    interactive=False,
+                    visible=False,
+                )
+                intervention_type_radio = gr.Radio(
+                    choices=[t.value for t in InterventionType],
+                    value=InterventionType.ACTIVATION_PATCH.value,
+                    label="Intervention Type",
+                    visible=False,
+                )
+                sweep_mode_radio = gr.Radio(
+                    choices=["Layer Sweep (all positions)", "Full Position × Layer Sweep"],
+                    value="Layer Sweep (all positions)",
+                    label="Sweep Mode",
+                    visible=False,
+                )
+
+                # Update token resolution display when tokens are typed
+                def update_token_info(correct_text, incorrect_text):
+                    parts = []
+                    if correct_text and correct_text.strip():
+                        try:
+                            _, display = INTERVENTION_ENGINE.resolve_token(correct_text.strip())
+                            parts.append(f"Correct: {display}")
+                        except ValueError as e:
+                            parts.append(f"Correct: {e}")
+                    if incorrect_text and incorrect_text.strip():
+                        try:
+                            _, display = INTERVENTION_ENGINE.resolve_token(incorrect_text.strip())
+                            parts.append(f"Incorrect: {display}")
+                        except ValueError as e:
+                            parts.append(f"Incorrect: {e}")
+                    return " | ".join(parts) if parts else ""
+
+                correct_token_input.change(
+                    fn=update_token_info,
+                    inputs=[correct_token_input, incorrect_token_input],
+                    outputs=[token_info_display],
+                )
+                incorrect_token_input.change(
+                    fn=update_token_info,
+                    inputs=[correct_token_input, incorrect_token_input],
+                    outputs=[token_info_display],
+                )
+
             with gr.Column(scale=2):
                 output_plot = gr.Plot(label="Attention Visualization")
                 output_info = gr.Textbox(label="Info", interactive=False, lines=4)
@@ -374,19 +493,30 @@ SSM layers interpretable alongside standard Transformer attention.
         # Toggle visibility of controls based on view mode
         def on_view_mode_change(mode):
             is_multistep = (mode == "Multi-Step Generation")
+            is_intervention = (mode == "Causal Intervention")
             return (
-                gr.update(visible=is_multistep),   # max_tokens_slider
-                gr.update(visible=is_multistep),   # step_nav_slider
+                gr.update(visible=is_multistep),     # max_tokens_slider
+                gr.update(visible=is_multistep),     # step_nav_slider
+                gr.update(visible=is_intervention),  # correct_token_input
+                gr.update(visible=is_intervention),  # incorrect_token_input
+                gr.update(visible=is_intervention),  # token_info_display
+                gr.update(visible=is_intervention),  # intervention_type_radio
+                gr.update(visible=is_intervention),  # sweep_mode_radio
             )
 
         view_mode.change(
             fn=on_view_mode_change,
             inputs=[view_mode],
-            outputs=[max_tokens_slider, step_nav_slider],
+            outputs=[
+                max_tokens_slider, step_nav_slider,
+                correct_token_input, incorrect_token_input, token_info_display,
+                intervention_type_radio, sweep_mode_radio,
+            ],
         )
 
         # Main analysis function
-        def analyze(prompt, prompt_b, view_mode, layer_idx, head_agg, max_tokens, step_idx):
+        def analyze(prompt, prompt_b, view_mode, layer_idx, head_agg, max_tokens, step_idx,
+                    correct_token, incorrect_token, intervention_type, sweep_mode):
             if not prompt or not prompt.strip():
                 return None, "Please enter a prompt.", gr.update()
 
@@ -405,6 +535,11 @@ SSM layers interpretable alongside standard Transformer attention.
                     fig, info = neuron_activation_view(prompt, layer_idx)
                 elif view_mode == "Activation Diff":
                     fig, info = activation_diff_view(prompt, prompt_b, head_agg)
+                elif view_mode == "Causal Intervention":
+                    fig, info = intervention_view(
+                        prompt, prompt_b, correct_token, incorrect_token,
+                        intervention_type, sweep_mode,
+                    )
                 else:
                     return None, "Unknown view mode.", gr.update()
                 return fig, info, gr.update()
@@ -412,7 +547,9 @@ SSM layers interpretable alongside standard Transformer attention.
                 return None, f"Error: {str(e)}", gr.update()
 
         all_inputs = [prompt_input, prompt_b_input, view_mode, layer_slider,
-                      head_agg, max_tokens_slider, step_nav_slider]
+                      head_agg, max_tokens_slider, step_nav_slider,
+                      correct_token_input, incorrect_token_input,
+                      intervention_type_radio, sweep_mode_radio]
         all_outputs = [output_plot, output_info, step_nav_slider]
 
         analyze_btn.click(fn=analyze, inputs=all_inputs, outputs=all_outputs)
@@ -453,4 +590,4 @@ if __name__ == "__main__":
     auth_user = os.environ.get("GRADIO_AUTH_USERNAME")
     auth_pass = os.environ.get("GRADIO_AUTH_PASSWORD")
     auth = (auth_user, auth_pass) if auth_user and auth_pass else None
-    app.launch(share=True, auth=auth, server_name="0.0.0.0", server_port=7860)
+    app.launch(share=False, auth=auth, server_name="127.0.0.1", server_port=7860)
