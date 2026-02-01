@@ -450,4 +450,7 @@ SSM layers interpretable alongside standard Transformer attention.
 if __name__ == "__main__":
     initialize()
     app = build_app()
-    app.launch(share=True, auth=("team", "granite2025"), server_name="0.0.0.0", server_port=7860)
+    auth_user = os.environ.get("GRADIO_AUTH_USERNAME")
+    auth_pass = os.environ.get("GRADIO_AUTH_PASSWORD")
+    auth = (auth_user, auth_pass) if auth_user and auth_pass else None
+    app.launch(share=True, auth=auth, server_name="0.0.0.0", server_port=7860)
