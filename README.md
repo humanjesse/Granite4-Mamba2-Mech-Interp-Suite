@@ -24,6 +24,7 @@ Mamba-2's scalar-identity A matrix makes this extraction computationally cheap (
 - **Neuron Activation** view showing which MLP neurons fire strongly for each input token — captures SwiGLU intermediate activations (`silu(gate) * up`) from every layer's `shared_mlp`, ranks by absolute magnitude, and displays per-token top-k neurons to identify interpretable features
 - **Activation Diff** for comparing two prompts side-by-side — shows residual stream cosine similarity per layer, Jensen-Shannon divergence of attention patterns, top changed neurons, and logit lens prediction differences in a 2×2 dashboard
 - **Multi-Step Generation** analysis that generates tokens one at a time and runs full interpretability extraction at each step — browse through generation steps with a slider to see how attention patterns, neuron activations, and logit lens predictions shift as the sequence grows
+- **Causal Intervention** (activation patching) to identify which layers are causally responsible for a prediction — run a clean prompt and a corrupted prompt, then sweep across layers patching clean activations into the corrupted run to measure recovery. Supports activation patching, zero/mean ablation, and noise injection, with layer sweep and full position-by-layer heatmap modes
 - **Interactive Gradio UI** with layer selection, head aggregation, step navigation, and example prompts
 
 ## Architecture
@@ -72,7 +73,7 @@ The app will be available at `http://localhost:7860`.
 ## Running Tests
 
 ```bash
-python -m pytest tests/test_extraction.py -v
+python -m pytest tests/ -v
 ```
 
 ## Technical Details
@@ -90,6 +91,8 @@ python -m pytest tests/test_extraction.py -v
 5. **Activation Diff**: Run full extraction on two prompts, then compare across four dimensions. Residual stream cosine similarity measures how layer representations diverge. Attention pattern divergence uses Jensen-Shannon divergence (symmetric, bounded KL-based metric) on row-normalized attention distributions. Top changed neurons are ranked by mean absolute activation delta across all tokens. Logit lens diff compares the top-1 predicted token at each layer between the two prompts.
 
 6. **Multi-Step Generation**: Autoregressive loop that generates tokens one at a time using greedy decoding from the model's output logits. At each step, the full extraction pipeline runs on the growing sequence — capturing attention patterns, neuron activations, residual stream, and logit lens data. All step results are cached in memory so users can browse through generation steps without re-computation. The per-step dashboard shows a token timeline, compact logit lens (last 8 layers), and representative Mamba/Transformer attention heatmaps.
+
+7. **Causal Intervention**: Activation patching engine that caches residual stream activations from a clean run, then replays the corrupted prompt with hooks that swap in clean activations at a target layer. Measures fractional recovery: `(patched_logit_diff - corrupted_logit_diff) / (clean_logit_diff - corrupted_logit_diff)`. Supports four intervention types (activation patch, zero ablation, mean ablation, noise). Layer sweep mode runs 32 forward passes; full position-by-layer sweep produces a 2D heatmap at the cost of `num_layers × seq_len` passes. Note: Mamba layers have internal recurrent state (conv/SSM) that is not patched — recovery scores for Mamba layers should be interpreted with this caveat (see `docs/session-notes-causal-intervention.md`).
 
 ### Hardware
 
