@@ -26,6 +26,8 @@ from src.visualization.intervention_viz import (
     create_full_sweep_dashboard,
     format_intervention_info,
 )
+from src.extraction.circuit_discovery import CircuitDiscoveryEngine, SweepGranularity
+from src.visualization.circuit_viz import create_circuit_dashboard, format_circuit_info
 
 # Global state
 MODEL = None
@@ -37,11 +39,13 @@ MULTISTEP_CACHE = {}
 INTERVENTION_ENGINE = None
 INTERVENTION_CACHE = {}
 INTERVENTION_CACHE_MAX = 20
+CIRCUIT_ENGINE = None
+CIRCUIT_CACHE = {}
 
 
 def initialize():
     """Load model and set up extractor."""
-    global MODEL, TOKENIZER, EXTRACTOR, ARCH_MAP, INTERVENTION_ENGINE
+    global MODEL, TOKENIZER, EXTRACTOR, ARCH_MAP, INTERVENTION_ENGINE, CIRCUIT_ENGINE
 
     # Use CPU by default — .to(cuda) hangs intermittently on gfx1151.
     # 350M model runs fine on CPU. Set DEVICE=cuda to force GPU.
@@ -51,6 +55,7 @@ def initialize():
     ARCH_MAP = ArchitectureMap(MODEL.config)
     EXTRACTOR = GraniteAttentionExtractor(MODEL, TOKENIZER, device=device)
     INTERVENTION_ENGINE = CausalInterventionEngine(MODEL, TOKENIZER, ARCH_MAP, device=device)
+    CIRCUIT_ENGINE = CircuitDiscoveryEngine(MODEL, TOKENIZER, ARCH_MAP, device=device)
     print(f"Model loaded. {ARCH_MAP.summary()}")
 
 
@@ -317,6 +322,46 @@ def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_t
     return fig, info
 
 
+def circuit_discovery_view(clean_prompt, corrupted_prompt, correct_token, incorrect_token,
+                           threshold, granularity):
+    """Run circuit discovery and visualize results."""
+    corrupted_prompt = corrupted_prompt or ""
+    correct_token = correct_token or ""
+    incorrect_token = incorrect_token or ""
+    threshold = float(threshold) if threshold else 0.1
+    granularity = granularity or "Fast (layer paths only)"
+
+    if not corrupted_prompt or not corrupted_prompt.strip():
+        return None, "Please enter a corrupted prompt."
+    if not correct_token or not correct_token.strip():
+        return None, "Please enter a correct token (the answer the clean prompt should produce)."
+    if not incorrect_token or not incorrect_token.strip():
+        return None, "Please enter an incorrect token (the answer the corrupted prompt produces)."
+
+    gran = SweepGranularity.DETAILED if "Detailed" in granularity else SweepGranularity.FAST
+
+    cache_key = (
+        clean_prompt.strip(), corrupted_prompt.strip(),
+        correct_token.strip(), incorrect_token.strip(),
+        threshold, gran.value,
+    )
+
+    if cache_key in CIRCUIT_CACHE:
+        circuit_result = CIRCUIT_CACHE[cache_key]
+    else:
+        circuit_result = CIRCUIT_ENGINE.find_circuit(
+            clean_prompt, corrupted_prompt,
+            correct_token.strip(), incorrect_token.strip(),
+            threshold=threshold,
+            granularity=gran,
+        )
+        CIRCUIT_CACHE[cache_key] = circuit_result
+
+    fig = create_circuit_dashboard(circuit_result, ARCH_MAP)
+    info = format_circuit_info(circuit_result)
+    return fig, info
+
+
 def get_layer_type_label(layer_idx):
     """Return the layer type for display."""
     layer_idx = int(layer_idx)
@@ -380,7 +425,7 @@ SSM layers interpretable alongside standard Transformer attention.
                 )
 
                 view_mode = gr.Radio(
-                    choices=["Single Layer", "Mamba vs Transformer", "All Layers", "Logit Lens", "Neuron Activation", "Activation Diff", "Causal Intervention", "Multi-Step Generation"],
+                    choices=["Single Layer", "Mamba vs Transformer", "All Layers", "Logit Lens", "Neuron Activation", "Activation Diff", "Causal Intervention", "Circuit Discovery", "Multi-Step Generation"],
                     value="Single Layer",
                     label="View Mode",
                 )
@@ -457,6 +502,23 @@ SSM layers interpretable alongside standard Transformer attention.
                     visible=False,
                 )
 
+                # Circuit Discovery controls
+                circuit_threshold_slider = gr.Slider(
+                    minimum=0.01,
+                    maximum=0.5,
+                    step=0.01,
+                    value=0.1,
+                    label="Circuit Threshold",
+                    info="Minimum recovery score for a node/edge to be included in the circuit",
+                    visible=False,
+                )
+                circuit_granularity_radio = gr.Radio(
+                    choices=["Fast (layer paths only)", "Detailed (+ attention heads)"],
+                    value="Fast (layer paths only)",
+                    label="Sweep Granularity",
+                    visible=False,
+                )
+
                 # Update token resolution display when tokens are typed
                 def update_token_info(correct_text, incorrect_text):
                     if INTERVENTION_ENGINE is None:
@@ -502,14 +564,18 @@ SSM layers interpretable alongside standard Transformer attention.
         def on_view_mode_change(mode):
             is_multistep = (mode == "Multi-Step Generation")
             is_intervention = (mode == "Causal Intervention")
+            is_circuit = (mode == "Circuit Discovery")
+            needs_tokens = is_intervention or is_circuit
             return (
                 gr.update(visible=is_multistep),     # max_tokens_slider
                 gr.update(visible=is_multistep),     # step_nav_slider
-                gr.update(visible=is_intervention),  # correct_token_input
-                gr.update(visible=is_intervention),  # incorrect_token_input
-                gr.update(visible=is_intervention),  # token_info_display
+                gr.update(visible=needs_tokens),     # correct_token_input
+                gr.update(visible=needs_tokens),     # incorrect_token_input
+                gr.update(visible=needs_tokens),     # token_info_display
                 gr.update(visible=is_intervention),  # intervention_type_radio
                 gr.update(visible=is_intervention),  # sweep_mode_radio
+                gr.update(visible=is_circuit),       # circuit_threshold_slider
+                gr.update(visible=is_circuit),       # circuit_granularity_radio
             )
 
         view_mode.change(
@@ -519,12 +585,14 @@ SSM layers interpretable alongside standard Transformer attention.
                 max_tokens_slider, step_nav_slider,
                 correct_token_input, incorrect_token_input, token_info_display,
                 intervention_type_radio, sweep_mode_radio,
+                circuit_threshold_slider, circuit_granularity_radio,
             ],
         )
 
         # Main analysis function
         def analyze(prompt, prompt_b, view_mode, layer_idx, head_agg, max_tokens, step_idx,
-                    correct_token, incorrect_token, intervention_type, sweep_mode):
+                    correct_token, incorrect_token, intervention_type, sweep_mode,
+                    circuit_threshold, circuit_granularity):
             if not prompt or not prompt.strip():
                 return None, "Please enter a prompt.", gr.update()
 
@@ -548,6 +616,11 @@ SSM layers interpretable alongside standard Transformer attention.
                         prompt, prompt_b, correct_token, incorrect_token,
                         intervention_type, sweep_mode,
                     )
+                elif view_mode == "Circuit Discovery":
+                    fig, info = circuit_discovery_view(
+                        prompt, prompt_b, correct_token, incorrect_token,
+                        circuit_threshold, circuit_granularity,
+                    )
                 else:
                     return None, "Unknown view mode.", gr.update()
                 return fig, info, gr.update()
@@ -557,7 +630,8 @@ SSM layers interpretable alongside standard Transformer attention.
         all_inputs = [prompt_input, prompt_b_input, view_mode, layer_slider,
                       head_agg, max_tokens_slider, step_nav_slider,
                       correct_token_input, incorrect_token_input,
-                      intervention_type_radio, sweep_mode_radio]
+                      intervention_type_radio, sweep_mode_radio,
+                      circuit_threshold_slider, circuit_granularity_radio]
         all_outputs = [output_plot, output_info, step_nav_slider]
 
         analyze_btn.click(fn=analyze, inputs=all_inputs, outputs=all_outputs)
