@@ -5,6 +5,8 @@ import matplotlib.colors as mcolors
 import numpy as np
 from matplotlib.patches import Patch
 
+from src.extraction.causal_intervention import MIN_RECOVERY_DENOMINATOR
+
 
 def create_layer_sweep_dashboard(sweep_result, arch_map) -> plt.Figure:
     """Create a 2-panel dashboard for layer sweep results.
@@ -253,6 +255,29 @@ def format_intervention_info(sweep_result) -> str:
         f"Corrupted logit diff: {sweep_result.corrupted_logit_diff:+.3f}  |  P(correct): {sweep_result.corrupted_prob_correct:.4f}",
         "",
     ]
+
+    # Baseline quality warnings
+    denominator = sweep_result.clean_logit_diff - sweep_result.corrupted_logit_diff
+    if abs(denominator) <= MIN_RECOVERY_DENOMINATOR:
+        lines.append(
+            "⚠ WARNING: Clean and corrupted logit diffs are nearly identical "
+            f"(denominator={denominator:+.2e}). Recovery scores are meaningless — "
+            "the model may not distinguish these prompts for the chosen tokens."
+        )
+        lines.append("")
+    elif sweep_result.clean_logit_diff < 0:
+        lines.append(
+            "⚠ WARNING: Clean logit diff is NEGATIVE — the model already prefers "
+            f"the 'incorrect' token on the clean prompt (diff={sweep_result.clean_logit_diff:+.3f}). "
+            "Recovery scores may be inverted. Check your token assignments."
+        )
+        lines.append("")
+    elif abs(denominator) < 1.0:
+        lines.append(
+            f"⚠ CAUTION: Small denominator ({denominator:+.3f}). The model only weakly "
+            "distinguishes these prompts, so recovery scores may be noisy."
+        )
+        lines.append("")
 
     recovery = sweep_result.recovery_matrix.numpy()
     if recovery.ndim == 1:

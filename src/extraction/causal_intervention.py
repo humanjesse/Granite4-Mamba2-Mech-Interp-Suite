@@ -18,6 +18,10 @@ from enum import Enum
 from ..architecture_map import ArchitectureMap
 
 MAX_SEQ_LEN = 256
+# Minimum denominator (clean_logit_diff - corrupted_logit_diff) to compute
+# a meaningful recovery score.  Below this the clean and corrupted runs are
+# too similar for activation patching to be informative.
+MIN_RECOVERY_DENOMINATOR = 1e-6
 
 
 class InterventionType(Enum):
@@ -314,7 +318,7 @@ class CausalInterventionEngine:
                 - patched_logits[0, -1, incorrect_id].float()
             ).item()
 
-            if abs(denominator) > 1e-6:
+            if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
                 recovery_scores[layer_idx] = (patched_diff - corrupted_logit_diff) / denominator
             else:
                 recovery_scores[layer_idx] = 0.0
@@ -391,7 +395,7 @@ class CausalInterventionEngine:
                     - patched_logits[0, -1, incorrect_id].float()
                 ).item()
 
-                if abs(denominator) > 1e-6:
+                if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
                     recovery_matrix[i, pos] = (patched_diff - corrupted_logit_diff) / denominator
                 else:
                     recovery_matrix[i, pos] = 0.0

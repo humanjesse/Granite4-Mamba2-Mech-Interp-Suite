@@ -8,6 +8,7 @@ from src.extraction.causal_intervention import (
     InterventionType,
     SweepResult,
     CausalInterventionEngine,
+    MIN_RECOVERY_DENOMINATOR,
 )
 
 
@@ -65,7 +66,7 @@ def test_recovery_score_partial():
 def test_recovery_score_zero_denominator():
     """When clean == corrupted, recovery should be 0 (not crash)."""
     denominator = 0.0
-    if abs(denominator) > 1e-8:
+    if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
         recovery = 1.0 / denominator
     else:
         recovery = 0.0
@@ -429,8 +430,8 @@ def test_bfloat16_logit_diff_precision():
 
 def test_recovery_score_clamped_on_small_denominator():
     """When denominator is near the threshold, recovery should be 0."""
-    denominator = 5e-7  # smaller than 1e-6 threshold
-    if abs(denominator) > 1e-6:
+    denominator = MIN_RECOVERY_DENOMINATOR / 2  # below threshold
+    if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
         recovery = 1.0 / denominator
     else:
         recovery = 0.0
@@ -447,7 +448,7 @@ def test_recovery_no_nan_inf():
     ]
     for clean_diff, corrupt_diff, patched_diff in test_cases:
         denom = clean_diff - corrupt_diff
-        if abs(denom) > 1e-6:
+        if abs(denom) > MIN_RECOVERY_DENOMINATOR:
             recovery = (patched_diff - corrupt_diff) / denom
         else:
             recovery = 0.0
@@ -520,3 +521,151 @@ def test_sweep_result_shapes(mock_engine):
     assert result.recovery_matrix.dim() == 1
     assert result.recovery_matrix.shape[0] == mock_engine.arch_map.num_layers
     assert len(result.layer_indices) == mock_engine.arch_map.num_layers
+
+
+# ---- sweep_positions_and_layers tests ----
+
+def test_full_sweep_result_shape(mock_engine):
+    """sweep_positions_and_layers should return a 2D [num_layers, seq_len] matrix."""
+    _setup_sweep_mocks(mock_engine)
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        result = mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+        )
+
+    num_layers = mock_engine.arch_map.num_layers
+    seq_len = 3  # from convert_ids_to_tokens mock
+    assert result.recovery_matrix.dim() == 2
+    assert result.recovery_matrix.shape == (num_layers, seq_len)
+    assert len(result.layer_indices) == num_layers
+    assert len(result.position_indices) == seq_len
+
+
+def test_full_sweep_forward_pass_count(mock_engine):
+    """sweep_positions_and_layers should call run_with_intervention num_layers * seq_len times."""
+    _setup_sweep_mocks(mock_engine)
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+        )
+        num_layers = mock_engine.arch_map.num_layers
+        seq_len = 3
+        assert mock_rwi.call_count == num_layers * seq_len
+
+
+def test_full_sweep_progress_callback(mock_engine):
+    """Progress callback should be called num_layers * seq_len times with correct totals."""
+    _setup_sweep_mocks(mock_engine)
+    callback_calls = []
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+            progress_callback=lambda step, total: callback_calls.append((step, total)),
+        )
+
+    total = mock_engine.arch_map.num_layers * 3
+    assert len(callback_calls) == total
+    assert callback_calls[-1] == (total, total)
+    # Steps should be monotonically increasing
+    steps = [s for s, _ in callback_calls]
+    assert steps == list(range(1, total + 1))
+
+
+def test_full_sweep_layer_subset(mock_engine):
+    """layer_subset should limit which layers are swept."""
+    _setup_sweep_mocks(mock_engine)
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        result = mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+            layer_subset=[0, 2],
+        )
+
+    assert result.recovery_matrix.shape == (2, 3)  # 2 layers, 3 positions
+    assert result.layer_indices == [0, 2]
+    assert mock_rwi.call_count == 2 * 3
+
+
+def test_full_sweep_each_call_patches_single_position(mock_engine):
+    """Each run_with_intervention call should patch exactly one position."""
+    _setup_sweep_mocks(mock_engine)
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+        )
+
+        for call in mock_rwi.call_args_list:
+            positions = call.kwargs.get("positions") or call[1].get("positions")
+            # positions is a keyword arg
+            if positions is None:
+                pytest.fail("positions should not be None in full sweep — expected [pos]")
+            else:
+                assert len(positions) == 1, f"Expected single position, got {positions}"
+
+
+def test_full_sweep_no_nan_inf(mock_engine):
+    """Full sweep recovery scores should not contain NaN or Inf."""
+    _setup_sweep_mocks(mock_engine)
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        result = mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+        )
+
+    assert not torch.isnan(result.recovery_matrix).any(), "Recovery matrix contains NaN"
+    assert not torch.isinf(result.recovery_matrix).any(), "Recovery matrix contains Inf"
+
+
+def test_full_sweep_populates_sweep_result_fields(mock_engine):
+    """All SweepResult fields should be populated correctly."""
+    _setup_sweep_mocks(mock_engine)
+
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+        mock_rwi.return_value = torch.randn(1, 3, 2000)
+        result = mock_engine.sweep_positions_and_layers(
+            clean_prompt="The capital of France is",
+            corrupted_prompt="The capital of Poland is",
+            correct_token="Paris",
+            incorrect_token="Warsaw",
+            intervention_type=InterventionType.ZERO_ABLATION,
+        )
+
+    assert result.correct_token == "Paris"
+    assert result.incorrect_token == "Warsaw"
+    assert result.correct_token_id == 10
+    assert result.incorrect_token_id == 20
+    assert result.intervention_type == InterventionType.ZERO_ABLATION
+    assert isinstance(result.clean_logit_diff, float)
+    assert isinstance(result.corrupted_logit_diff, float)
+    assert isinstance(result.clean_prob_correct, float)
+    assert isinstance(result.corrupted_prob_correct, float)
+    assert len(result.clean_tokens) == 3
+    assert len(result.corrupted_tokens) == 3

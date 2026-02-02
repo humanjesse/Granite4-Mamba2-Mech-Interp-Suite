@@ -20,7 +20,7 @@ from src.extraction.activation_diff import compute_activation_diff
 from src.visualization.activation_diff_viz import create_activation_diff_summary, format_diff_info
 from src.extraction.multistep_generator import run_multistep_generation
 from src.visualization.multistep_viz import create_multistep_dashboard, format_multistep_info
-from src.extraction.causal_intervention import CausalInterventionEngine, InterventionType
+from src.extraction.causal_intervention import CausalInterventionEngine, InterventionType, MIN_RECOVERY_DENOMINATOR
 from src.visualization.intervention_viz import (
     create_layer_sweep_dashboard,
     create_full_sweep_dashboard,
@@ -36,6 +36,7 @@ CACHE = {}
 MULTISTEP_CACHE = {}
 INTERVENTION_ENGINE = None
 INTERVENTION_CACHE = {}
+INTERVENTION_CACHE_MAX = 20
 
 
 def initialize():
@@ -261,6 +262,9 @@ def multistep_view(prompt, max_tokens, step_idx, head_agg):
 def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_token,
                       intervention_type, sweep_mode):
     """Run causal intervention experiment and visualize results."""
+    if INTERVENTION_ENGINE is None:
+        return None, "Intervention engine not initialized. Please restart the app."
+
     corrupted_prompt = corrupted_prompt or ""
     correct_token = correct_token or ""
     incorrect_token = incorrect_token or ""
@@ -292,14 +296,16 @@ def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_t
                 int_type,
             )
         else:
-            # Both "Layer Sweep (all positions)" and "Single Position × All Layers"
-            # use sweep_layers — the difference is the positions argument
             positions = None  # all positions by default
             sweep_result = INTERVENTION_ENGINE.sweep_layers(
                 clean_prompt, corrupted_prompt,
                 correct_token.strip(), incorrect_token.strip(),
                 int_type, positions=positions,
             )
+        # Evict oldest entries if cache is full
+        if len(INTERVENTION_CACHE) >= INTERVENTION_CACHE_MAX:
+            oldest_key = next(iter(INTERVENTION_CACHE))
+            del INTERVENTION_CACHE[oldest_key]
         INTERVENTION_CACHE[cache_key] = sweep_result
 
     if sweep_result.recovery_matrix.dim() == 1:
@@ -453,6 +459,8 @@ SSM layers interpretable alongside standard Transformer attention.
 
                 # Update token resolution display when tokens are typed
                 def update_token_info(correct_text, incorrect_text):
+                    if INTERVENTION_ENGINE is None:
+                        return "Intervention engine not initialized."
                     parts = []
                     if correct_text and correct_text.strip():
                         try:
