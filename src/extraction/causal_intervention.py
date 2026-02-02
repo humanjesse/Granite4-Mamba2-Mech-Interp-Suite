@@ -11,17 +11,10 @@ for the model's knowledge of that fact.
 """
 
 import torch
-import torch.nn.functional as F
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
-from ..architecture_map import ArchitectureMap
-
-MAX_SEQ_LEN = 256
-# Minimum denominator (clean_logit_diff - corrupted_logit_diff) to compute
-# a meaningful recovery score.  Below this the clean and corrupted runs are
-# too similar for activation patching to be informative.
-MIN_RECOVERY_DENOMINATOR = 1e-6
+from .intervention_base import InterventionBase, MAX_SEQ_LEN, MIN_RECOVERY_DENOMINATOR
 
 
 class InterventionType(Enum):
@@ -57,100 +50,13 @@ class SweepResult:
     corrupted_prob_correct: float
 
 
-class CausalInterventionEngine:
+class CausalInterventionEngine(InterventionBase):
     """Run causal intervention experiments on the Granite hybrid model.
 
     This engine patches activations from a clean run into a corrupted run
     to determine which layers and positions are causally responsible for
     a model's prediction.
     """
-
-    def __init__(self, model, tokenizer, arch_map: ArchitectureMap, device: str = "cpu"):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.arch_map = arch_map
-        self.device = device
-        # Internal cache: prompt string -> {residual_stream, logits, tokens}
-        self._prompt_cache: dict[str, dict] = {}
-
-    def resolve_token(self, text: str) -> tuple[int, str]:
-        """Resolve a text string to a token ID.
-
-        Takes the last token from the tokenization of the input text.
-        Returns (token_id, display_string) where display_string shows
-        the exact resolution for UI feedback.
-
-        This handles the space-prefix issue: "Paris" and " Paris" may
-        tokenize differently. The display string makes this visible.
-        """
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if not token_ids:
-            raise ValueError(f"Could not tokenize '{text}' — no tokens produced")
-        if len(token_ids) > 1:
-            import warnings
-            warnings.warn(
-                f"'{text}' tokenizes to {len(token_ids)} tokens; using last token only."
-            )
-        token_id = token_ids[-1]
-        decoded = self.tokenizer.decode(token_id)
-        display = f'"{text}" → token {token_id} ("{decoded}")'
-        return token_id, display
-
-    def run_and_cache(self, prompt: str) -> dict:
-        """Run a forward pass and cache residual stream activations at every layer.
-
-        Uses an internal cache so repeated calls with the same prompt
-        (e.g., switching from layer sweep to full sweep) reuse results.
-
-        Returns dict with:
-            residual_stream: {layer_idx: Tensor[batch, seq, hidden_dim]}
-            logits: Tensor[batch, seq, vocab_size]
-            tokens: list[str]
-        """
-        cache_key = prompt.strip()
-        if cache_key in self._prompt_cache:
-            return self._prompt_cache[cache_key]
-
-        inputs = self.tokenizer(
-            prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
-        ).to(self.device)
-        input_ids = inputs["input_ids"]
-        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
-
-        # Register residual stream hooks (read-only)
-        storage = {}
-        hooks = []
-        for layer_idx in range(self.arch_map.num_layers):
-            layer = self.model.model.layers[layer_idx]
-
-            def hook_fn(module, input, output, _idx=layer_idx):
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                else:
-                    hidden = output
-                storage[_idx] = hidden.detach().clone().cpu()
-
-            h = layer.register_forward_hook(hook_fn)
-            hooks.append(h)
-
-        try:
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-        finally:
-            for h in hooks:
-                h.remove()
-
-        result = {
-            "residual_stream": storage,
-            "logits": outputs.logits.detach().cpu(),
-            "tokens": tokens,
-        }
-        self._prompt_cache[cache_key] = result
-        return result
-
-    def clear_cache(self):
-        """Clear the internal prompt cache."""
-        self._prompt_cache.clear()
 
     def run_with_intervention(
         self,
@@ -232,39 +138,6 @@ class CausalInterventionEngine:
             hook.remove()
 
         return outputs.logits.detach().cpu()
-
-    def _compute_baselines(
-        self,
-        clean_cache: dict,
-        corrupted_cache: dict,
-        correct_id: int,
-        incorrect_id: int,
-    ) -> tuple[float, float, float, float, float]:
-        """Compute baseline logit diffs, probabilities, and denominator.
-
-        Returns (clean_logit_diff, corrupted_logit_diff, denominator,
-                 clean_prob_correct, corrupted_prob_correct).
-        """
-        clean_logit_diff = (
-            clean_cache["logits"][0, -1, correct_id].float()
-            - clean_cache["logits"][0, -1, incorrect_id].float()
-        ).item()
-        corrupted_logit_diff = (
-            corrupted_cache["logits"][0, -1, correct_id].float()
-            - corrupted_cache["logits"][0, -1, incorrect_id].float()
-        ).item()
-        denominator = clean_logit_diff - corrupted_logit_diff
-
-        clean_probs = torch.softmax(clean_cache["logits"][0, -1].float(), dim=-1)
-        corrupted_probs = torch.softmax(corrupted_cache["logits"][0, -1].float(), dim=-1)
-
-        return (
-            clean_logit_diff,
-            corrupted_logit_diff,
-            denominator,
-            clean_probs[correct_id].item(),
-            corrupted_probs[correct_id].item(),
-        )
 
     def sweep_layers(
         self,

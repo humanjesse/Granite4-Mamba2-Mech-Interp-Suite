@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import numpy as np
-from matplotlib.patches import FancyArrowPatch
 
 
 # ── Color scheme (consistent with intervention_viz) ──────────────────────────
@@ -29,6 +28,14 @@ def create_circuit_dashboard(circuit_result, arch_map) -> plt.Figure:
       FAST mode:  2x2 (path matrix, layer importance, circuit diagram, summary)
       DETAILED mode: 3x2 (adds component importance panel)
     """
+    if circuit_result is None:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.5, "No circuit discovery results available.",
+                ha="center", va="center", fontsize=14, color="gray",
+                transform=ax.transAxes)
+        ax.axis("off")
+        return fig
+
     has_components = len(circuit_result.component_results) > 0
 
     if has_components:
@@ -239,12 +246,21 @@ def _plot_circuit_diagram(ax, circuit_result, arch_map):
 
     num_layers = arch_map.num_layers
 
-    # Position nodes: y = layer_idx (inverted, top=early layers), x = type
+    # Position nodes: y = evenly spaced within each type column, x = type
+    # Group nodes by type for even spacing
+    mamba_nodes = [n for n in nodes if n.layer_type == "mamba"]
+    attn_nodes = [n for n in nodes if n.layer_type != "mamba"]
+    # Sort by layer index so vertical order matches layer order
+    mamba_nodes.sort(key=lambda n: n.layer_idx)
+    attn_nodes.sort(key=lambda n: n.layer_idx)
+
     node_positions = {}
-    for node in nodes:
-        y = 1.0 - (node.layer_idx / max(num_layers - 1, 1))
-        x = 0.3 if node.layer_type == "mamba" else 0.7
-        node_positions[node.layer_idx] = (x, y)
+    for group, x_pos in [(mamba_nodes, 0.3), (attn_nodes, 0.7)]:
+        n = len(group)
+        for i, node in enumerate(group):
+            # Space evenly with margin, or center if single node
+            y = 1.0 - (i / max(n - 1, 1)) if n > 1 else 0.5
+            node_positions[node.layer_idx] = (x_pos, y)
 
     # Draw edges first (behind nodes)
     max_edge_importance = max((abs(e.importance) for e in edges), default=1.0)
@@ -369,6 +385,9 @@ def _plot_circuit_summary(ax, circuit_result, arch_map):
 
 def format_circuit_info(circuit_result) -> str:
     """Format circuit discovery results as text for the Gradio info panel."""
+    if circuit_result is None:
+        return "No circuit discovery results available."
+
     nodes = circuit_result.circuit_nodes
     edges = circuit_result.circuit_edges
 

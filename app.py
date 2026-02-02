@@ -20,7 +20,7 @@ from src.extraction.activation_diff import compute_activation_diff
 from src.visualization.activation_diff_viz import create_activation_diff_summary, format_diff_info
 from src.extraction.multistep_generator import run_multistep_generation
 from src.visualization.multistep_viz import create_multistep_dashboard, format_multistep_info
-from src.extraction.causal_intervention import CausalInterventionEngine, InterventionType, MIN_RECOVERY_DENOMINATOR
+from src.extraction.causal_intervention import CausalInterventionEngine, InterventionType
 from src.visualization.intervention_viz import (
     create_layer_sweep_dashboard,
     create_full_sweep_dashboard,
@@ -41,6 +41,7 @@ INTERVENTION_CACHE = {}
 INTERVENTION_CACHE_MAX = 20
 CIRCUIT_ENGINE = None
 CIRCUIT_CACHE = {}
+CIRCUIT_CACHE_MAX = 10
 
 
 def initialize():
@@ -325,10 +326,13 @@ def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_t
 def circuit_discovery_view(clean_prompt, corrupted_prompt, correct_token, incorrect_token,
                            threshold, granularity):
     """Run circuit discovery and visualize results."""
+    if CIRCUIT_ENGINE is None:
+        return None, "Circuit discovery engine not initialized. Please restart the app."
+
     corrupted_prompt = corrupted_prompt or ""
     correct_token = correct_token or ""
     incorrect_token = incorrect_token or ""
-    threshold = float(threshold) if threshold else 0.1
+    threshold = float(threshold) if threshold is not None else 0.1
     granularity = granularity or "Fast (layer paths only)"
 
     if not corrupted_prompt or not corrupted_prompt.strip():
@@ -355,6 +359,10 @@ def circuit_discovery_view(clean_prompt, corrupted_prompt, correct_token, incorr
             threshold=threshold,
             granularity=gran,
         )
+        # Evict oldest entries if cache is full
+        if len(CIRCUIT_CACHE) >= CIRCUIT_CACHE_MAX:
+            oldest_key = next(iter(CIRCUIT_CACHE))
+            del CIRCUIT_CACHE[oldest_key]
         CIRCUIT_CACHE[cache_key] = circuit_result
 
     fig = create_circuit_dashboard(circuit_result, ARCH_MAP)

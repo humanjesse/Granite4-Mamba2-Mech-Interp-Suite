@@ -26,13 +26,10 @@ reveals how these two mechanisms collaborate.
 """
 
 import torch
-import torch.nn.functional as F
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..architecture_map import ArchitectureMap
-
-MAX_SEQ_LEN = 256
+from .intervention_base import InterventionBase, MAX_SEQ_LEN, MIN_RECOVERY_DENOMINATOR
 
 
 class SweepGranularity(Enum):
@@ -111,82 +108,12 @@ class CircuitResult:
     granularity: SweepGranularity
 
 
-class CircuitDiscoveryEngine:
+class CircuitDiscoveryEngine(InterventionBase):
     """Discover circuits in the Granite hybrid model via path patching.
 
-    Builds on the CausalInterventionEngine pattern but adds path-specific
-    patching and automatic circuit extraction.
+    Builds on the InterventionBase with path-specific patching and
+    automatic circuit extraction.
     """
-
-    def __init__(self, model, tokenizer, arch_map: ArchitectureMap, device: str = "cpu"):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.arch_map = arch_map
-        self.device = device
-        self._prompt_cache: dict[str, dict] = {}
-
-    def resolve_token(self, text: str) -> tuple[int, str]:
-        """Resolve a text string to a token ID (last token from tokenization)."""
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if not token_ids:
-            raise ValueError(f"Could not tokenize '{text}' — no tokens produced")
-        if len(token_ids) > 1:
-            import warnings
-            warnings.warn(
-                f"'{text}' tokenizes to {len(token_ids)} tokens; using last token only."
-            )
-        token_id = token_ids[-1]
-        decoded = self.tokenizer.decode(token_id)
-        display = f'"{text}" → token {token_id} ("{decoded}")'
-        return token_id, display
-
-    def run_and_cache(self, prompt: str) -> dict:
-        """Run a forward pass and cache both residual stream and per-layer outputs.
-
-        Returns dict with:
-            residual_stream: {layer_idx: Tensor[batch, seq, hidden_dim]} — output of each layer
-            logits: Tensor[batch, seq, vocab_size]
-            tokens: list[str]
-        """
-        cache_key = prompt.strip()
-        if cache_key in self._prompt_cache:
-            return self._prompt_cache[cache_key]
-
-        inputs = self.tokenizer(
-            prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
-        ).to(self.device)
-        input_ids = inputs["input_ids"]
-        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
-
-        storage = {}
-        hooks = []
-        for layer_idx in range(self.arch_map.num_layers):
-            layer = self.model.model.layers[layer_idx]
-
-            def hook_fn(module, input, output, _idx=layer_idx):
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                else:
-                    hidden = output
-                storage[_idx] = hidden.detach().clone().cpu()
-
-            h = layer.register_forward_hook(hook_fn)
-            hooks.append(h)
-
-        try:
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-        finally:
-            for h in hooks:
-                h.remove()
-
-        result = {
-            "residual_stream": storage,
-            "logits": outputs.logits.detach().cpu(),
-            "tokens": tokens,
-        }
-        self._prompt_cache[cache_key] = result
-        return result
 
     def _compute_layer_output(self, prompt: str) -> dict:
         """Compute the *isolated contribution* of each layer to the residual stream.
@@ -232,40 +159,6 @@ class CircuitDiscoveryEngine:
             layer_contributions[layer_idx] = residual[layer_idx] - prev_residual
 
         return layer_contributions
-
-    def clear_cache(self):
-        """Clear the internal prompt cache."""
-        self._prompt_cache.clear()
-
-    def _get_logit_diff(self, logits: torch.Tensor, correct_id: int, incorrect_id: int) -> float:
-        """Compute logit difference at last position."""
-        return (
-            logits[0, -1, correct_id].float()
-            - logits[0, -1, incorrect_id].float()
-        ).item()
-
-    def _compute_baselines(
-        self,
-        clean_cache: dict,
-        corrupted_cache: dict,
-        correct_id: int,
-        incorrect_id: int,
-    ) -> tuple[float, float, float, float, float]:
-        """Compute baseline logit diffs, probabilities, and denominator."""
-        clean_logit_diff = self._get_logit_diff(clean_cache["logits"], correct_id, incorrect_id)
-        corrupted_logit_diff = self._get_logit_diff(corrupted_cache["logits"], correct_id, incorrect_id)
-        denominator = clean_logit_diff - corrupted_logit_diff
-
-        clean_probs = torch.softmax(clean_cache["logits"][0, -1].float(), dim=-1)
-        corrupted_probs = torch.softmax(corrupted_cache["logits"][0, -1].float(), dim=-1)
-
-        return (
-            clean_logit_diff,
-            corrupted_logit_diff,
-            denominator,
-            clean_probs[correct_id].item(),
-            corrupted_probs[correct_id].item(),
-        )
 
     def path_patch(
         self,
@@ -338,7 +231,7 @@ class CircuitDiscoveryEngine:
         patched_logits = outputs.logits.detach().cpu()
         patched_diff = self._get_logit_diff(patched_logits, correct_id, incorrect_id)
 
-        if abs(denominator) > 1e-6:
+        if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
             return (patched_diff - corrupted_logit_diff) / denominator
         return 0.0
 
@@ -387,7 +280,7 @@ class CircuitDiscoveryEngine:
                 corrupted_prompt, layer_idx, clean_cache
             )
             patched_diff = self._get_logit_diff(patched_logits, correct_id, incorrect_id)
-            if abs(denominator) > 1e-6:
+            if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
                 layer_importance[layer_idx] = (patched_diff - corrupted_logit_diff) / denominator
 
         # Phase 2: Path patching for all source->target pairs
@@ -487,6 +380,8 @@ class CircuitDiscoveryEngine:
         """
         if not self.arch_map.is_attention(layer_idx):
             return 0.0
+        if not hasattr(self.model.model.layers[layer_idx], 'self_attn'):
+            return 0.0
 
         inputs = self.tokenizer(
             corrupted_prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
@@ -567,7 +462,7 @@ class CircuitDiscoveryEngine:
         patched_logits = outputs.logits.detach().cpu()
         patched_diff = self._get_logit_diff(patched_logits, correct_id, incorrect_id)
 
-        if abs(denominator) > 1e-6:
+        if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
             return (patched_diff - corrupted_logit_diff) / denominator
         return 0.0
 
@@ -643,6 +538,12 @@ class CircuitDiscoveryEngine:
         Returns a CircuitResult with the full path matrix, layer importance,
         component results, and the extracted circuit graph.
         """
+        # Validate prompts produce tokens
+        clean_cache = self.run_and_cache(clean_prompt)
+        corrupted_cache = self.run_and_cache(corrupted_prompt)
+        if not clean_cache["tokens"] or not corrupted_cache["tokens"]:
+            raise ValueError("One or both prompts produced no tokens.")
+
         # Phase 1+2: Sweep paths (includes layer sweep internally)
         path_matrix, layer_importance, metadata = self.sweep_paths(
             clean_prompt, corrupted_prompt,
