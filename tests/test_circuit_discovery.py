@@ -247,7 +247,7 @@ def test_patch_attention_head_returns_zero_for_mamba(mock_engine):
     score = mock_engine.patch_attention_head(
         "clean", "corrupt", layer_idx=0, head_idx=0,
         correct_id=10, incorrect_id=20,
-        clean_cache={}, corrupted_logit_diff=0.0, denominator=1.0,
+        corrupted_logit_diff=0.0, denominator=1.0,
     )
     assert score == 0.0
 
@@ -255,20 +255,25 @@ def test_patch_attention_head_returns_zero_for_mamba(mock_engine):
 # ---- Test hook cleanup ----
 
 def test_run_and_cache_hook_cleanup(mock_engine):
-    """All hooks should be removed after run_and_cache."""
+    """All hooks (embedding + layers) should be removed after run_and_cache."""
     mock_output = _make_mock_model_output()
     mock_engine.model.return_value = mock_output
 
-    handles = []
+    embed_handle = MagicMock()
+    embed_handle.remove = MagicMock()
+    mock_engine.model.model.embed_tokens.register_forward_hook = MagicMock(return_value=embed_handle)
+
+    layer_handles = []
     for layer in mock_engine.model.model.layers:
         handle = MagicMock()
         handle.remove = MagicMock()
         layer.register_forward_hook = MagicMock(return_value=handle)
-        handles.append(handle)
+        layer_handles.append(handle)
 
     mock_engine.run_and_cache("test prompt")
 
-    for handle in handles:
+    embed_handle.remove.assert_called_once()
+    for handle in layer_handles:
         handle.remove.assert_called_once()
 
 
@@ -276,17 +281,22 @@ def test_hook_cleanup_on_exception(mock_engine):
     """Hooks should be removed even if forward pass raises."""
     mock_engine.model.side_effect = RuntimeError("forward pass failed")
 
-    handles = []
+    embed_handle = MagicMock()
+    embed_handle.remove = MagicMock()
+    mock_engine.model.model.embed_tokens.register_forward_hook = MagicMock(return_value=embed_handle)
+
+    layer_handles = []
     for layer in mock_engine.model.model.layers:
         handle = MagicMock()
         handle.remove = MagicMock()
         layer.register_forward_hook = MagicMock(return_value=handle)
-        handles.append(handle)
+        layer_handles.append(handle)
 
     with pytest.raises(RuntimeError, match="forward pass failed"):
         mock_engine.run_and_cache("test prompt")
 
-    for handle in handles:
+    embed_handle.remove.assert_called_once()
+    for handle in layer_handles:
         handle.remove.assert_called_once()
 
 
@@ -331,10 +341,11 @@ def test_run_with_layer_patch_returns_logits(mock_engine):
     mock_output = _make_mock_model_output(seq_len=3, vocab_size=100)
     mock_engine.model.return_value = mock_output
 
-    clean_cache = {
-        "residual_stream": {0: torch.randn(1, 3, 32)},
-    }
-    result = mock_engine._run_with_layer_patch("test prompt", 0, clean_cache)
+    clean_contributions = {0: torch.randn(1, 3, 32)}
+    corrupted_contributions = {0: torch.randn(1, 3, 32)}
+    result = mock_engine._run_with_layer_patch(
+        "test prompt", 0, clean_contributions, corrupted_contributions
+    )
     assert result.shape[0] == 1  # batch
     assert result.shape[2] == 100  # vocab size
 
@@ -348,8 +359,9 @@ def test_run_with_layer_patch_hook_cleanup(mock_engine):
     handle.remove = MagicMock()
     mock_engine.model.model.layers[1].register_forward_hook = MagicMock(return_value=handle)
 
-    clean_cache = {"residual_stream": {1: torch.randn(1, 3, 32)}}
-    mock_engine._run_with_layer_patch("test", 1, clean_cache)
+    clean_contributions = {1: torch.randn(1, 3, 32)}
+    corrupted_contributions = {1: torch.randn(1, 3, 32)}
+    mock_engine._run_with_layer_patch("test", 1, clean_contributions, corrupted_contributions)
     handle.remove.assert_called_once()
 
 
@@ -361,9 +373,10 @@ def test_run_with_layer_patch_hook_cleanup_on_exception(mock_engine):
     handle.remove = MagicMock()
     mock_engine.model.model.layers[0].register_forward_hook = MagicMock(return_value=handle)
 
-    clean_cache = {"residual_stream": {0: torch.randn(1, 3, 32)}}
+    clean_contributions = {0: torch.randn(1, 3, 32)}
+    corrupted_contributions = {0: torch.randn(1, 3, 32)}
     with pytest.raises(RuntimeError, match="boom"):
-        mock_engine._run_with_layer_patch("test", 0, clean_cache)
+        mock_engine._run_with_layer_patch("test", 0, clean_contributions, corrupted_contributions)
     handle.remove.assert_called_once()
 
 
@@ -474,13 +487,14 @@ def test_sweep_paths_progress_callback(mock_engine):
 
 def test_sweep_components_only_sweeps_transformer_layers(mock_engine):
     """sweep_components should only call patch_attention_head on Transformer layers."""
-    with patch.object(mock_engine, 'patch_attention_head') as mock_pah:
+    with patch.object(mock_engine, '_capture_clean_attn_output', return_value=torch.randn(1, 3, 32)), \
+         patch.object(mock_engine, 'patch_attention_head') as mock_pah:
         mock_pah.return_value = 0.3
 
         results = mock_engine.sweep_components(
             "clean", "corrupt",
             correct_id=10, incorrect_id=20,
-            clean_cache={}, corrupted_logit_diff=0.0, denominator=1.0,
+            corrupted_logit_diff=0.0, denominator=1.0,
         )
 
     # Only layer 2 is attention in our mock (arch_map.attention_indices = [2])
@@ -495,7 +509,8 @@ def test_sweep_components_only_sweeps_transformer_layers(mock_engine):
 
 def test_sweep_components_filters_by_important_layers(mock_engine):
     """When important_layers is provided, only those layers are swept."""
-    with patch.object(mock_engine, 'patch_attention_head') as mock_pah:
+    with patch.object(mock_engine, '_capture_clean_attn_output', return_value=torch.randn(1, 3, 32)), \
+         patch.object(mock_engine, 'patch_attention_head') as mock_pah:
         mock_pah.return_value = 0.0
 
         # Layer 2 is the only Transformer layer, but important_layers=[0,1]
@@ -503,7 +518,7 @@ def test_sweep_components_filters_by_important_layers(mock_engine):
         results = mock_engine.sweep_components(
             "clean", "corrupt",
             correct_id=10, incorrect_id=20,
-            clean_cache={}, corrupted_logit_diff=0.0, denominator=1.0,
+            corrupted_logit_diff=0.0, denominator=1.0,
             important_layers=[0, 1],  # neither is Transformer
         )
 
@@ -515,19 +530,39 @@ def test_sweep_components_progress_callback(mock_engine):
     """Progress callback should fire for each head."""
     callback_calls = []
 
-    with patch.object(mock_engine, 'patch_attention_head') as mock_pah:
+    with patch.object(mock_engine, '_capture_clean_attn_output', return_value=torch.randn(1, 3, 32)), \
+         patch.object(mock_engine, 'patch_attention_head') as mock_pah:
         mock_pah.return_value = 0.1
 
         mock_engine.sweep_components(
             "clean", "corrupt",
             correct_id=10, incorrect_id=20,
-            clean_cache={}, corrupted_logit_diff=0.0, denominator=1.0,
+            corrupted_logit_diff=0.0, denominator=1.0,
             progress_callback=lambda step, total: callback_calls.append((step, total)),
         )
 
     num_heads = mock_engine.model.config.num_attention_heads
     assert len(callback_calls) == num_heads
     assert callback_calls[-1] == (num_heads, num_heads)
+
+
+def test_sweep_components_one_clean_pass_per_layer(mock_engine):
+    """_capture_clean_attn_output should be called once per target layer, not per head."""
+    with patch.object(mock_engine, '_capture_clean_attn_output', return_value=torch.randn(1, 3, 32)) as mock_cap, \
+         patch.object(mock_engine, 'patch_attention_head') as mock_pah:
+        mock_pah.return_value = 0.1
+
+        mock_engine.sweep_components(
+            "clean", "corrupt",
+            correct_id=10, incorrect_id=20,
+            corrupted_logit_diff=0.0, denominator=1.0,
+        )
+
+    # Only 1 Transformer layer (layer 2) in mock, so exactly 1 capture call
+    assert mock_cap.call_count == 1
+    # But patch_attention_head called once per head
+    num_heads = mock_engine.model.config.num_attention_heads
+    assert mock_pah.call_count == num_heads
 
 
 # ---- Test find_circuit ----
@@ -607,6 +642,70 @@ def test_find_circuit_detailed_mode_calls_sweep_components(mock_engine):
     assert len(result.component_results) == 1
 
 
+def test_find_circuit_detailed_progress_monotonic(mock_engine):
+    """In DETAILED mode with a callback, progress (step/total) should never decrease."""
+    _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
+    num_heads = mock_engine.model.config.num_attention_heads
+
+    fake_path_matrix = torch.zeros(num_layers, num_layers)
+    fake_layer_importance = torch.tensor([0.0, 0.0, 0.5, 0.0])  # layer 2 important
+    fake_metadata = {
+        "correct_id": 10, "incorrect_id": 20,
+        "correct_display": "Paris", "incorrect_display": "Warsaw",
+        "clean_logit_diff": 5.0, "corrupted_logit_diff": -3.0,
+        "denominator": 8.0,
+        "clean_prob_correct": 0.9, "corrupted_prob_correct": 0.1,
+        "clean_tokens": ["The", "capital", "of"],
+        "corrupted_tokens": ["The", "capital", "of"],
+        "clean_contributions": {}, "corrupted_contributions": {},
+    }
+
+    callback_calls = []
+
+    # We need sweep_paths and sweep_components to actually invoke the callback
+    # so we can observe the wrapped values.
+    def fake_sweep_paths(clean, corrupt, correct, incorrect, progress_callback=None):
+        path_total = num_layers + num_layers * (num_layers - 1) // 2
+        if progress_callback:
+            for step in range(num_layers, path_total + 1):
+                progress_callback(step, path_total)
+        return (fake_path_matrix, fake_layer_importance, fake_metadata)
+
+    def fake_sweep_components(clean, corrupt, correct_id, incorrect_id,
+                              corrupted_logit_diff, denominator,
+                              important_layers=None, progress_callback=None):
+        total = num_heads  # 1 Transformer layer (layer 2) * num_heads
+        if progress_callback:
+            for step in range(1, total + 1):
+                progress_callback(step, total)
+        return [
+            ComponentResult(layer_idx=2, component_idx=i,
+                            component_type="attention_head", recovery_score=0.3)
+            for i in range(num_heads)
+        ]
+
+    with patch.object(mock_engine, 'sweep_paths', side_effect=fake_sweep_paths), \
+         patch.object(mock_engine, 'sweep_components', side_effect=fake_sweep_components):
+        mock_engine.find_circuit(
+            "The capital of France is", "The capital of Poland is",
+            "Paris", "Warsaw",
+            threshold=0.1,
+            granularity=SweepGranularity.DETAILED,
+            progress_callback=lambda step, total: callback_calls.append((step, total)),
+        )
+
+    assert len(callback_calls) > 0
+    # Progress ratio should be monotonically non-decreasing
+    ratios = [step / total for step, total in callback_calls]
+    for i in range(1, len(ratios)):
+        assert ratios[i] >= ratios[i - 1], (
+            f"Progress went backwards at index {i}: {ratios[i-1]:.3f} -> {ratios[i]:.3f}"
+        )
+    # Final call should reach 100%
+    assert ratios[-1] == pytest.approx(1.0)
+
+
 def test_find_circuit_empty_tokens_raises(mock_engine):
     """find_circuit should raise ValueError when prompts produce no tokens."""
     mock_output = _make_mock_model_output(seq_len=3, vocab_size=100)
@@ -625,34 +724,14 @@ def test_compute_layer_output_returns_per_layer_contributions(mock_engine):
     """_compute_layer_output should return a dict with one entry per layer."""
     num_layers = mock_engine.arch_map.num_layers
 
-    # Set up run_and_cache to return fake residual stream
+    fake_embedding = torch.randn(1, 3, 32)
     fake_residuals = {i: torch.randn(1, 3, 32) for i in range(num_layers)}
     fake_cache = {
         "residual_stream": fake_residuals,
+        "embedding": fake_embedding,
         "logits": torch.randn(1, 3, 100),
         "tokens": ["The", "capital", "of"],
     }
-
-    # Capture the embed hook so we can fire it during the mock forward pass
-    captured_hook = None
-
-    def fake_register(fn, **kwargs):
-        nonlocal captured_hook
-        captured_hook = fn
-        handle = MagicMock()
-        handle.remove = MagicMock()
-        return handle
-
-    mock_engine.model.model.embed_tokens.register_forward_hook = fake_register
-
-    fake_embedding = torch.randn(1, 3, 32)
-
-    def fake_forward(**kwargs):
-        if captured_hook:
-            captured_hook(None, None, fake_embedding.clone())
-        return _make_mock_model_output()
-
-    mock_engine.model.side_effect = lambda **kw: fake_forward(**kw)
 
     with patch.object(mock_engine, 'run_and_cache', return_value=fake_cache):
         contributions = mock_engine._compute_layer_output("test prompt")
@@ -675,32 +754,10 @@ def test_compute_layer_output_layer0_uses_embedding(mock_engine):
 
     fake_cache = {
         "residual_stream": fake_residuals,
+        "embedding": embedding,
         "logits": torch.randn(1, 3, 100),
         "tokens": ["The", "capital", "of"],
     }
-
-    # We need to make the embed_hook fire with our fake embedding.
-    # The hook is registered on model.model.embed_tokens.
-    # When model(**inputs) is called, the hook should fire.
-    # We'll capture the hook function and call it manually.
-    captured_hook = None
-
-    def fake_register(fn, **kwargs):
-        nonlocal captured_hook
-        captured_hook = fn
-        handle = MagicMock()
-        handle.remove = MagicMock()
-        return handle
-
-    mock_engine.model.model.embed_tokens.register_forward_hook = fake_register
-
-    def fake_forward(**kwargs):
-        # Simulate the hook firing
-        if captured_hook:
-            captured_hook(None, None, embedding.clone())
-        return _make_mock_model_output()
-
-    mock_engine.model.side_effect = lambda **kw: fake_forward(**kw)
 
     with patch.object(mock_engine, 'run_and_cache', return_value=fake_cache):
         contributions = mock_engine._compute_layer_output("test prompt")
@@ -721,6 +778,6 @@ def test_patch_attention_head_returns_zero_when_no_self_attn(mock_engine):
     score = mock_engine.patch_attention_head(
         "clean", "corrupt", layer_idx=0, head_idx=0,
         correct_id=10, incorrect_id=20,
-        clean_cache={}, corrupted_logit_diff=0.0, denominator=1.0,
+        corrupted_logit_diff=0.0, denominator=1.0,
     )
     assert score == 0.0

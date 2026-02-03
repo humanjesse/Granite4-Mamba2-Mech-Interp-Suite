@@ -6,6 +6,7 @@ accelerate
 gradio>=4.0
 matplotlib
 numpy
+plotly>=5.0
 
 # Do NOT install mamba-ssm or causal-conv1d
 # (forces slow PyTorch path that exposes all SSM intermediates for extraction)

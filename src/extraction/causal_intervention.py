@@ -65,6 +65,8 @@ class CausalInterventionEngine(InterventionBase):
         target_layer: int,
         positions: list[int] | None,
         clean_cache: dict | None = None,
+        clean_contributions: dict | None = None,
+        corrupted_contributions: dict | None = None,
         noise_std: float = 1.0,
     ) -> torch.Tensor:
         """Run a forward pass with an intervention hook on a specific layer.
@@ -98,12 +100,18 @@ class CausalInterventionEngine(InterventionBase):
                 pos_idx = torch.tensor(valid_pos, device=modified.device)
 
                 if intervention_type == InterventionType.ACTIVATION_PATCH:
-                    clean_hidden = clean_cache["residual_stream"][layer_idx].to(modified.device)
-                    # Only patch positions that exist in both clean and corrupted
-                    patch_pos = [p for p in valid_pos if p < clean_hidden.shape[1]]
+                    clean_c = clean_contributions[layer_idx].to(modified.device)
+                    corrupt_c = corrupted_contributions[layer_idx].to(modified.device)
+                    # Only patch positions that exist in both contribution tensors
+                    patch_pos = [p for p in valid_pos
+                                 if p < clean_c.shape[1] and p < corrupt_c.shape[1]]
                     if patch_pos:
                         idx = torch.tensor(patch_pos, device=modified.device)
-                        modified[:, idx, :] = clean_hidden[:, idx, :]
+                        modified[:, idx, :] = (
+                            modified[:, idx, :]
+                            - corrupt_c[:, idx, :]
+                            + clean_c[:, idx, :]
+                        )
 
                 elif intervention_type == InterventionType.ZERO_ABLATION:
                     modified[:, pos_idx, :] = 0.0
@@ -174,6 +182,13 @@ class CausalInterventionEngine(InterventionBase):
             corrupted_prob_correct,
         ) = self._compute_baselines(clean_cache, corrupted_cache, correct_id, incorrect_id)
 
+        # Compute per-layer isolated contributions for activation patching
+        clean_contributions = None
+        corrupted_contributions = None
+        if intervention_type == InterventionType.ACTIVATION_PATCH:
+            clean_contributions = self._compute_layer_output(clean_prompt)
+            corrupted_contributions = self._compute_layer_output(corrupted_prompt)
+
         # Phase 2: Sweep across layers
         num_layers = self.arch_map.num_layers
         recovery_scores = torch.zeros(num_layers)
@@ -184,7 +199,8 @@ class CausalInterventionEngine(InterventionBase):
                 intervention_type=intervention_type,
                 target_layer=layer_idx,
                 positions=positions,
-                clean_cache=clean_cache if intervention_type == InterventionType.ACTIVATION_PATCH else None,
+                clean_contributions=clean_contributions,
+                corrupted_contributions=corrupted_contributions,
             )
             patched_diff = (
                 patched_logits[0, -1, correct_id].float()
@@ -247,6 +263,13 @@ class CausalInterventionEngine(InterventionBase):
             corrupted_prob_correct,
         ) = self._compute_baselines(clean_cache, corrupted_cache, correct_id, incorrect_id)
 
+        # Compute per-layer isolated contributions for activation patching
+        clean_contributions = None
+        corrupted_contributions = None
+        if intervention_type == InterventionType.ACTIVATION_PATCH:
+            clean_contributions = self._compute_layer_output(clean_prompt)
+            corrupted_contributions = self._compute_layer_output(corrupted_prompt)
+
         layers = layer_subset or list(range(self.arch_map.num_layers))
         seq_len = len(corrupted_cache["tokens"])
         recovery_matrix = torch.zeros(len(layers), seq_len)
@@ -261,7 +284,8 @@ class CausalInterventionEngine(InterventionBase):
                     intervention_type=intervention_type,
                     target_layer=layer_idx,
                     positions=[pos],
-                    clean_cache=clean_cache if intervention_type == InterventionType.ACTIVATION_PATCH else None,
+                    clean_contributions=clean_contributions,
+                    corrupted_contributions=corrupted_contributions,
                 )
                 patched_diff = (
                     patched_logits[0, -1, correct_id].float()

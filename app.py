@@ -27,7 +27,15 @@ from src.visualization.intervention_viz import (
     format_intervention_info,
 )
 from src.extraction.circuit_discovery import CircuitDiscoveryEngine, SweepGranularity
-from src.visualization.circuit_viz import create_circuit_dashboard, format_circuit_info
+from src.visualization.circuit_viz import (
+    create_circuit_dashboard,
+    format_circuit_info,
+    create_path_matrix_plotly,
+    create_layer_importance_plotly,
+    create_circuit_diagram_plotly,
+    create_component_importance_plotly,
+    create_circuit_summary_markdown,
+)
 
 # Global state
 MODEL = None
@@ -266,29 +274,30 @@ def multistep_view(prompt, max_tokens, step_idx, head_agg):
 
 
 def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_token,
-                      intervention_type, sweep_mode):
+                      intervention_type, sweep_mode, progress_callback=None):
     """Run causal intervention experiment and visualize results."""
     if INTERVENTION_ENGINE is None:
         return None, "Intervention engine not initialized. Please restart the app."
 
-    corrupted_prompt = corrupted_prompt or ""
-    correct_token = correct_token or ""
-    incorrect_token = incorrect_token or ""
+    clean_prompt = (clean_prompt or "").strip()
+    corrupted_prompt = (corrupted_prompt or "").strip()
+    correct_token = (correct_token or "").strip()
+    incorrect_token = (incorrect_token or "").strip()
     intervention_type = intervention_type or InterventionType.ACTIVATION_PATCH.value
     sweep_mode = sweep_mode or "Layer Sweep (all positions)"
 
-    if not corrupted_prompt or not corrupted_prompt.strip():
+    if not corrupted_prompt:
         return None, "Please enter a corrupted prompt."
-    if not correct_token or not correct_token.strip():
+    if not correct_token:
         return None, "Please enter a correct token (the answer the clean prompt should produce)."
-    if not incorrect_token or not incorrect_token.strip():
+    if not incorrect_token:
         return None, "Please enter an incorrect token (the answer the corrupted prompt produces)."
 
     int_type = InterventionType(intervention_type)
 
     cache_key = (
-        clean_prompt.strip(), corrupted_prompt.strip(),
-        correct_token.strip(), incorrect_token.strip(),
+        clean_prompt, corrupted_prompt,
+        correct_token, incorrect_token,
         intervention_type, sweep_mode,
     )
 
@@ -298,15 +307,17 @@ def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_t
         if sweep_mode == "Full Position × Layer Sweep":
             sweep_result = INTERVENTION_ENGINE.sweep_positions_and_layers(
                 clean_prompt, corrupted_prompt,
-                correct_token.strip(), incorrect_token.strip(),
+                correct_token, incorrect_token,
                 int_type,
+                progress_callback=progress_callback,
             )
         else:
             positions = None  # all positions by default
             sweep_result = INTERVENTION_ENGINE.sweep_layers(
                 clean_prompt, corrupted_prompt,
-                correct_token.strip(), incorrect_token.strip(),
+                correct_token, incorrect_token,
                 int_type, positions=positions,
+                progress_callback=progress_callback,
             )
         # Evict oldest entries if cache is full
         if len(INTERVENTION_CACHE) >= INTERVENTION_CACHE_MAX:
@@ -324,29 +335,30 @@ def intervention_view(clean_prompt, corrupted_prompt, correct_token, incorrect_t
 
 
 def circuit_discovery_view(clean_prompt, corrupted_prompt, correct_token, incorrect_token,
-                           threshold, granularity):
+                           threshold, granularity, progress_callback=None):
     """Run circuit discovery and visualize results."""
     if CIRCUIT_ENGINE is None:
         return None, "Circuit discovery engine not initialized. Please restart the app."
 
-    corrupted_prompt = corrupted_prompt or ""
-    correct_token = correct_token or ""
-    incorrect_token = incorrect_token or ""
+    clean_prompt = (clean_prompt or "").strip()
+    corrupted_prompt = (corrupted_prompt or "").strip()
+    correct_token = (correct_token or "").strip()
+    incorrect_token = (incorrect_token or "").strip()
     threshold = float(threshold) if threshold is not None else 0.1
     granularity = granularity or "Fast (layer paths only)"
 
-    if not corrupted_prompt or not corrupted_prompt.strip():
+    if not corrupted_prompt:
         return None, "Please enter a corrupted prompt."
-    if not correct_token or not correct_token.strip():
+    if not correct_token:
         return None, "Please enter a correct token (the answer the clean prompt should produce)."
-    if not incorrect_token or not incorrect_token.strip():
+    if not incorrect_token:
         return None, "Please enter an incorrect token (the answer the corrupted prompt produces)."
 
     gran = SweepGranularity.DETAILED if "Detailed" in granularity else SweepGranularity.FAST
 
     cache_key = (
-        clean_prompt.strip(), corrupted_prompt.strip(),
-        correct_token.strip(), incorrect_token.strip(),
+        clean_prompt, corrupted_prompt,
+        correct_token, incorrect_token,
         threshold, gran.value,
     )
 
@@ -355,9 +367,10 @@ def circuit_discovery_view(clean_prompt, corrupted_prompt, correct_token, incorr
     else:
         circuit_result = CIRCUIT_ENGINE.find_circuit(
             clean_prompt, corrupted_prompt,
-            correct_token.strip(), incorrect_token.strip(),
+            correct_token, incorrect_token,
             threshold=threshold,
             granularity=gran,
+            progress_callback=progress_callback,
         )
         # Evict oldest entries if cache is full
         if len(CIRCUIT_CACHE) >= CIRCUIT_CACHE_MAX:
@@ -365,9 +378,8 @@ def circuit_discovery_view(clean_prompt, corrupted_prompt, correct_token, incorr
             del CIRCUIT_CACHE[oldest_key]
         CIRCUIT_CACHE[cache_key] = circuit_result
 
-    fig = create_circuit_dashboard(circuit_result, ARCH_MAP)
     info = format_circuit_info(circuit_result)
-    return fig, info
+    return circuit_result, info
 
 
 def get_layer_type_label(layer_idx):
@@ -558,7 +570,22 @@ SSM layers interpretable alongside standard Transformer attention.
                 )
 
             with gr.Column(scale=2):
-                output_plot = gr.Plot(label="Attention Visualization")
+                with gr.Column(visible=True) as single_plot_wrapper:
+                    output_plot = gr.Plot(label="Attention Visualization")
+
+                with gr.Column(visible=False) as circuit_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Path Matrix"):
+                            circuit_path_plot = gr.Plot(label="Path Patching Matrix")
+                        with gr.Tab("Layer Importance"):
+                            circuit_layer_plot = gr.Plot(label="Layer Importance")
+                        with gr.Tab("Circuit Diagram"):
+                            circuit_diagram_plot = gr.Plot(label="Discovered Circuit")
+                        with gr.Tab("Components"):
+                            circuit_component_plot = gr.Plot(label="Head Importance")
+                        with gr.Tab("Summary"):
+                            circuit_summary_md = gr.Markdown("Run circuit discovery to see results.")
+
                 output_info = gr.Textbox(label="Info", interactive=False, lines=4)
 
         # Update layer type label when slider changes
@@ -584,6 +611,8 @@ SSM layers interpretable alongside standard Transformer attention.
                 gr.update(visible=is_intervention),  # sweep_mode_radio
                 gr.update(visible=is_circuit),       # circuit_threshold_slider
                 gr.update(visible=is_circuit),       # circuit_granularity_radio
+                gr.update(visible=not is_circuit),   # single_plot_wrapper
+                gr.update(visible=is_circuit),       # circuit_output_wrapper
             )
 
         view_mode.change(
@@ -594,19 +623,62 @@ SSM layers interpretable alongside standard Transformer attention.
                 correct_token_input, incorrect_token_input, token_info_display,
                 intervention_type_radio, sweep_mode_radio,
                 circuit_threshold_slider, circuit_granularity_radio,
+                single_plot_wrapper, circuit_output_wrapper,
             ],
         )
+
+        # Helper: default gr.update() values for circuit-specific output slots
+        def _default_circuit_outputs():
+            return (
+                gr.update(visible=True),   # single_plot_wrapper
+                gr.update(visible=False),  # circuit_output_wrapper
+                gr.update(),               # circuit_path_plot
+                gr.update(),               # circuit_layer_plot
+                gr.update(),               # circuit_diagram_plot
+                gr.update(),               # circuit_component_plot
+                gr.update(),               # circuit_summary_md
+            )
 
         # Main analysis function
         def analyze(prompt, prompt_b, view_mode, layer_idx, head_agg, max_tokens, step_idx,
                     correct_token, incorrect_token, intervention_type, sweep_mode,
-                    circuit_threshold, circuit_granularity):
+                    circuit_threshold, circuit_granularity, progress=gr.Progress(track_tqdm=False)):
             if not prompt or not prompt.strip():
-                return None, "Please enter a prompt.", gr.update()
+                return (None, "Please enter a prompt.", gr.update()) + _default_circuit_outputs()
 
             try:
+                if view_mode == "Circuit Discovery":
+                    def cd_progress(step, total):
+                        progress(step / total, desc=f"Circuit discovery: {step}/{total}")
+
+                    circuit_result, info = circuit_discovery_view(
+                        prompt, prompt_b, correct_token, incorrect_token,
+                        circuit_threshold, circuit_granularity,
+                        progress_callback=cd_progress,
+                    )
+
+                    path_fig = create_path_matrix_plotly(circuit_result, ARCH_MAP)
+                    layer_fig = create_layer_importance_plotly(circuit_result, ARCH_MAP)
+                    diagram_fig = create_circuit_diagram_plotly(circuit_result, ARCH_MAP)
+                    component_fig = create_component_importance_plotly(circuit_result, ARCH_MAP)
+                    summary_md = create_circuit_summary_markdown(circuit_result, ARCH_MAP)
+
+                    return (
+                        gr.update(),              # output_plot (unused)
+                        info,                     # output_info
+                        gr.update(),              # step_nav_slider
+                        gr.update(visible=False), # single_plot_wrapper
+                        gr.update(visible=True),  # circuit_output_wrapper
+                        path_fig,                 # circuit_path_plot
+                        layer_fig,                # circuit_layer_plot
+                        diagram_fig,              # circuit_diagram_plot
+                        component_fig,            # circuit_component_plot
+                        summary_md,               # circuit_summary_md
+                    )
+
                 if view_mode == "Multi-Step Generation":
-                    return multistep_view(prompt, max_tokens, step_idx, head_agg)
+                    fig, info, slider_update = multistep_view(prompt, max_tokens, step_idx, head_agg)
+                    return (fig, info, slider_update) + _default_circuit_outputs()
                 elif view_mode == "Single Layer":
                     fig, info = single_layer_view(prompt, layer_idx, head_agg)
                 elif view_mode == "Mamba vs Transformer":
@@ -620,27 +692,30 @@ SSM layers interpretable alongside standard Transformer attention.
                 elif view_mode == "Activation Diff":
                     fig, info = activation_diff_view(prompt, prompt_b, head_agg)
                 elif view_mode == "Causal Intervention":
+                    def iv_progress(step, total):
+                        progress(step / total, desc=f"Intervention sweep: {step}/{total}")
+
                     fig, info = intervention_view(
                         prompt, prompt_b, correct_token, incorrect_token,
                         intervention_type, sweep_mode,
-                    )
-                elif view_mode == "Circuit Discovery":
-                    fig, info = circuit_discovery_view(
-                        prompt, prompt_b, correct_token, incorrect_token,
-                        circuit_threshold, circuit_granularity,
+                        progress_callback=iv_progress,
                     )
                 else:
-                    return None, "Unknown view mode.", gr.update()
-                return fig, info, gr.update()
+                    return (None, "Unknown view mode.", gr.update()) + _default_circuit_outputs()
+                return (fig, info, gr.update()) + _default_circuit_outputs()
             except Exception as e:
-                return None, f"Error: {str(e)}", gr.update()
+                return (None, f"Error: {str(e)}", gr.update()) + _default_circuit_outputs()
 
         all_inputs = [prompt_input, prompt_b_input, view_mode, layer_slider,
                       head_agg, max_tokens_slider, step_nav_slider,
                       correct_token_input, incorrect_token_input,
                       intervention_type_radio, sweep_mode_radio,
                       circuit_threshold_slider, circuit_granularity_radio]
-        all_outputs = [output_plot, output_info, step_nav_slider]
+        all_outputs = [output_plot, output_info, step_nav_slider,
+                       single_plot_wrapper, circuit_output_wrapper,
+                       circuit_path_plot, circuit_layer_plot,
+                       circuit_diagram_plot, circuit_component_plot,
+                       circuit_summary_md]
 
         analyze_btn.click(fn=analyze, inputs=all_inputs, outputs=all_outputs)
 
@@ -649,11 +724,12 @@ SSM layers interpretable alongside standard Transformer attention.
 
         # Step slider navigates between cached steps without re-generating
         def on_step_change(prompt, max_tokens, step_idx, head_agg, current_mode):
+            no_change = (gr.update(), gr.update()) + tuple(gr.update() for _ in range(5))
             if current_mode != "Multi-Step Generation":
-                return gr.update(), gr.update()
+                return no_change
             cache_key = (prompt.strip(), int(max_tokens))
             if cache_key not in MULTISTEP_CACHE:
-                return gr.update(), gr.update()
+                return no_change
             result = MULTISTEP_CACHE[cache_key]
             num_steps = len(result["steps"])
             step_idx = max(0, min(int(step_idx), num_steps - 1))
@@ -663,12 +739,15 @@ SSM layers interpretable alongside standard Transformer attention.
                 head_agg=head_agg,
             )
             info = format_multistep_info(result, step_idx)
-            return fig, info
+            return (fig, info) + tuple(gr.update() for _ in range(5))
 
         step_nav_slider.release(
             fn=on_step_change,
             inputs=[prompt_input, max_tokens_slider, step_nav_slider, head_agg, view_mode],
-            outputs=[output_plot, output_info],
+            outputs=[output_plot, output_info,
+                     circuit_path_plot, circuit_layer_plot,
+                     circuit_diagram_plot, circuit_component_plot,
+                     circuit_summary_md],
         )
 
     return app

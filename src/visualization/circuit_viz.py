@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import numpy as np
+import plotly.graph_objects as go
 
 
 # ── Color scheme (consistent with intervention_viz) ──────────────────────────
@@ -67,7 +68,7 @@ def create_circuit_dashboard(circuit_result, arch_map) -> plt.Figure:
     _plot_circuit_diagram(ax_circuit, circuit_result, arch_map)
     _plot_circuit_summary(ax_summary, circuit_result, arch_map)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.subplots_adjust(top=0.94)
     return fig
 
 
@@ -381,6 +382,330 @@ def _plot_circuit_summary(ax, circuit_result, arch_map):
         transform=ax.transAxes, fontsize=9, fontfamily="monospace",
         verticalalignment="top",
     )
+
+
+# ── Plotly visualization functions ────────────────────────────────────────────
+
+def create_path_matrix_plotly(circuit_result, arch_map):
+    """Interactive path patching heatmap using Plotly."""
+    if circuit_result is None:
+        fig = go.Figure()
+        fig.add_annotation(text="No circuit discovery results available.",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(size=14, color="gray"))
+        return fig
+
+    matrix = circuit_result.path_matrix.numpy()
+    num_layers = matrix.shape[0]
+
+    # Mask lower triangle with NaN
+    display = matrix.copy()
+    for i in range(num_layers):
+        for j in range(i + 1):
+            display[i, j] = float("nan")
+
+    # Layer labels
+    labels = []
+    for i in range(num_layers):
+        lt = arch_map.layer_type(i)
+        marker = "M" if lt == "mamba" else "T"
+        labels.append(f"{i} ({marker})")
+
+    # Hover text
+    hover = []
+    for i in range(num_layers):
+        row = []
+        for j in range(num_layers):
+            if j <= i:
+                row.append("")
+            else:
+                row.append(f"Source L{i} → Target L{j}: {matrix[i, j]:.3f}")
+        hover.append(row)
+
+    vmax = max(float(np.nanmax(np.abs(display[np.isfinite(display)]))), 0.1)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=display, x=labels, y=labels,
+        colorscale="RdBu_r", zmid=0, zmin=-vmax, zmax=vmax,
+        hovertext=hover, hoverinfo="text",
+        colorbar=dict(title="Recovery"),
+    ))
+
+    # Indicator lines at Transformer layer positions
+    for idx in arch_map.attention_indices:
+        fig.add_hline(y=idx, line=dict(color=TRANSFORMER_COLOR, width=0.5, dash="dot"), opacity=0.4)
+        fig.add_vline(x=idx, line=dict(color=TRANSFORMER_COLOR, width=0.5, dash="dot"), opacity=0.4)
+
+    fig.update_layout(
+        title="Path Patching Matrix",
+        xaxis_title="Target Layer (downstream)",
+        yaxis_title="Source Layer (upstream)",
+        width=700, height=600,
+    )
+    return fig
+
+
+def create_layer_importance_plotly(circuit_result, arch_map):
+    """Interactive layer importance bar chart using Plotly."""
+    if circuit_result is None:
+        fig = go.Figure()
+        fig.add_annotation(text="No circuit discovery results available.",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(size=14, color="gray"))
+        return fig
+
+    importance = circuit_result.layer_importance.numpy()
+    layers = circuit_result.layer_indices
+    threshold = circuit_result.threshold
+
+    # Split into Mamba and Transformer traces
+    mamba_x, mamba_y = [], []
+    trans_x, trans_y = [], []
+    for i, idx in enumerate(layers):
+        lt = arch_map.layer_type(idx)
+        if lt == "mamba":
+            mamba_x.append(idx)
+            mamba_y.append(float(importance[i]))
+        else:
+            trans_x.append(idx)
+            trans_y.append(float(importance[i]))
+
+    fig = go.Figure()
+    if mamba_x:
+        fig.add_trace(go.Bar(
+            x=mamba_x, y=mamba_y, name="Mamba",
+            marker_color=MAMBA_COLOR,
+            hovertemplate="Layer %{x} (Mamba): %{y:.3f}<extra></extra>",
+        ))
+    if trans_x:
+        fig.add_trace(go.Bar(
+            x=trans_x, y=trans_y, name="Transformer",
+            marker_color=TRANSFORMER_COLOR,
+            hovertemplate="Layer %{x} (Transformer): %{y:.3f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=threshold, line=dict(color="gold", width=1, dash="dash"),
+                  annotation_text=f"threshold={threshold}")
+    fig.add_hline(y=-threshold, line=dict(color="gold", width=1, dash="dash"))
+
+    fig.update_layout(
+        title="Layer Importance (Activation Patching)",
+        xaxis_title="Layer", yaxis_title="Fractional Recovery",
+        barmode="overlay",
+        width=700, height=500,
+    )
+    return fig
+
+
+def create_circuit_diagram_plotly(circuit_result, arch_map, max_nodes=15):
+    """Interactive circuit diagram using Plotly with top-N filtering."""
+    if circuit_result is None:
+        fig = go.Figure()
+        fig.add_annotation(text="No circuit discovery results available.",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(size=14, color="gray"))
+        return fig
+
+    nodes = circuit_result.circuit_nodes
+    edges = circuit_result.circuit_edges
+
+    if not nodes:
+        fig = go.Figure()
+        fig.add_annotation(text="No circuit found above threshold\n(try lowering the threshold)",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(size=14, color="gray"))
+        fig.update_layout(title="Discovered Circuit")
+        return fig
+
+    # Top-N filtering
+    filtered_note = ""
+    if len(nodes) > max_nodes:
+        nodes = sorted(nodes, key=lambda n: abs(n.importance), reverse=True)[:max_nodes]
+        filtered_note = f"(showing top {max_nodes} of {len(circuit_result.circuit_nodes)} nodes)"
+        node_layers = {n.layer_idx for n in nodes}
+        edges = [e for e in edges
+                 if e.source_layer in node_layers and e.target_layer in node_layers]
+
+    num_layers = arch_map.num_layers
+
+    # Position: x by type, y by layer index (inverted so early layers at top)
+    node_positions = {}
+    for node in nodes:
+        x_pos = 0.3 if node.layer_type == "mamba" else 0.7
+        y_pos = 1.0 - node.layer_idx / max(num_layers - 1, 1)
+        node_positions[node.layer_idx] = (x_pos, y_pos)
+
+    fig = go.Figure()
+
+    # Draw edges as annotations (arrows)
+    max_edge_imp = max((abs(e.importance) for e in edges), default=1.0)
+    for edge in edges:
+        if edge.source_layer in node_positions and edge.target_layer in node_positions:
+            x1, y1 = node_positions[edge.source_layer]
+            x2, y2 = node_positions[edge.target_layer]
+            color = "#e53935" if edge.importance > 0 else "#1e88e5"
+            width = 1 + 3 * abs(edge.importance) / max(max_edge_imp, 1e-6)
+            fig.add_annotation(
+                x=x2, y=y2, ax=x1, ay=y1,
+                xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True,
+                arrowhead=2, arrowsize=1, arrowwidth=width,
+                arrowcolor=color, opacity=0.7,
+            )
+
+    # Draw nodes
+    for node in nodes:
+        x, y = node_positions[node.layer_idx]
+        color = MAMBA_COLOR if node.layer_type == "mamba" else TRANSFORMER_COLOR
+        size = 15 + 25 * abs(node.importance)
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode="markers+text",
+            marker=dict(size=size, color=color, line=dict(color="white", width=1.5)),
+            text=[f"L{node.layer_idx}"],
+            textposition="middle center",
+            textfont=dict(color="white", size=9),
+            hovertext=f"Layer {node.layer_idx} ({node.layer_type}): {node.importance:+.3f}",
+            hoverinfo="text",
+            showlegend=False,
+        ))
+
+    title = "Discovered Circuit"
+    if filtered_note:
+        title += f"<br><sub>{filtered_note}</sub>"
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(range=[0, 1], tickvals=[0.3, 0.7],
+                    ticktext=["Mamba", "Transformer"], title=""),
+        yaxis=dict(range=[-0.05, 1.05], showticklabels=False,
+                    title="Layer (top=early, bottom=late)"),
+        width=700, height=600,
+    )
+    return fig
+
+
+def create_component_importance_plotly(circuit_result, arch_map):
+    """Interactive attention head importance heatmap using Plotly."""
+    if circuit_result is None:
+        fig = go.Figure()
+        fig.add_annotation(text="No circuit discovery results available.",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(size=14, color="gray"))
+        return fig
+
+    components = circuit_result.component_results
+    if not components:
+        fig = go.Figure()
+        fig.add_annotation(text="No component data (use DETAILED mode)",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(size=14, color="gray"))
+        fig.update_layout(title="Component Importance")
+        return fig
+
+    layers_with_heads = sorted(set(c.layer_idx for c in components))
+    num_heads = max(c.component_idx for c in components) + 1
+
+    matrix = np.zeros((len(layers_with_heads), num_heads))
+    for c in components:
+        row = layers_with_heads.index(c.layer_idx)
+        matrix[row, c.component_idx] = c.recovery_score
+
+    y_labels = [f"L{idx}" for idx in layers_with_heads]
+    x_labels = [f"H{i}" for i in range(num_heads)]
+
+    hover = []
+    for ri, layer_idx in enumerate(layers_with_heads):
+        row = []
+        for ci in range(num_heads):
+            row.append(f"Layer {layer_idx}, Head {ci}: {matrix[ri, ci]:.3f}")
+        hover.append(row)
+
+    vmax = max(float(np.abs(matrix).max()), 0.1)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=matrix, x=x_labels, y=y_labels,
+        colorscale="RdBu_r", zmid=0, zmin=-vmax, zmax=vmax,
+        hovertext=hover, hoverinfo="text",
+        colorbar=dict(title="Recovery"),
+    ))
+
+    fig.update_layout(
+        title="Attention Head Importance",
+        xaxis_title="Attention Head",
+        yaxis_title="Transformer Layer",
+        width=700, height=500,
+    )
+    return fig
+
+
+def create_circuit_summary_markdown(circuit_result, arch_map) -> str:
+    """Format circuit discovery results as Markdown."""
+    if circuit_result is None:
+        return "No circuit discovery results available."
+
+    nodes = circuit_result.circuit_nodes
+    edges = circuit_result.circuit_edges
+    path_matrix = circuit_result.path_matrix.numpy()
+
+    lines = [
+        "## Circuit Discovery Results",
+        "",
+        f"**Correct token:** {circuit_result.correct_token_display}",
+        f"**Incorrect token:** {circuit_result.incorrect_token_display}",
+        "",
+        "| Metric | Clean | Corrupted |",
+        "|--------|-------|-----------|",
+        f"| Logit diff | {circuit_result.clean_logit_diff:+.3f} | {circuit_result.corrupted_logit_diff:+.3f} |",
+        f"| P(correct) | {circuit_result.clean_prob_correct:.4f} | {circuit_result.corrupted_prob_correct:.4f} |",
+        "",
+        f"**Threshold:** {circuit_result.threshold} · **Granularity:** {circuit_result.granularity.value}",
+        "",
+        f"### Circuit: {len(nodes)} nodes, {len(edges)} edges",
+    ]
+
+    if nodes:
+        n_mamba = sum(1 for n in nodes if n.layer_type == "mamba")
+        n_attn = sum(1 for n in nodes if n.layer_type == "attention")
+        lines.append(f"- Mamba nodes: {n_mamba} · Transformer nodes: {n_attn}")
+        lines.append("")
+        lines.append("**Top nodes:**")
+        lines.append("")
+        lines.append("| Layer | Type | Importance |")
+        lines.append("|-------|------|------------|")
+        top_nodes = sorted(nodes, key=lambda n: abs(n.importance), reverse=True)[:5]
+        for n in top_nodes:
+            lines.append(f"| {n.layer_idx} | {n.layer_type} | {n.importance:+.3f} |")
+
+    if path_matrix.size > 0:
+        upper = np.triu_indices_from(path_matrix, k=1)
+        values = path_matrix[upper]
+        if len(values) > 0:
+            lines.append("")
+            lines.append("**Top paths (source → target):**")
+            lines.append("")
+            lines.append("| Path | Recovery |")
+            lines.append("|------|----------|")
+            top_k = min(5, len(values))
+            top_flat_idx = np.argsort(np.abs(values))[::-1][:top_k]
+            for fi in top_flat_idx:
+                s, t = upper[0][fi], upper[1][fi]
+                val = values[fi]
+                s_type = "M" if arch_map.layer_type(s) == "mamba" else "T"
+                t_type = "M" if arch_map.layer_type(t) == "mamba" else "T"
+                lines.append(f"| L{s}{s_type} → L{t}{t_type} | {val:+.3f} |")
+
+    if circuit_result.component_results:
+        lines.append("")
+        lines.append("**Top attention heads:**")
+        lines.append("")
+        lines.append("| Layer | Head | Recovery |")
+        lines.append("|-------|------|----------|")
+        top_comps = sorted(circuit_result.component_results,
+                           key=lambda c: abs(c.recovery_score), reverse=True)[:5]
+        for c in top_comps:
+            lines.append(f"| {c.layer_idx} | {c.component_idx} | {c.recovery_score:+.3f} |")
+
+    return "\n".join(lines)
 
 
 def format_circuit_info(circuit_result) -> str:

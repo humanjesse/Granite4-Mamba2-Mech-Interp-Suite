@@ -1,10 +1,10 @@
-# Session Notes: Causal Intervention Feature
+# Session Notes: Causal Intervention & Circuit Discovery
 
-**Date:** 2026-02-01
+**Date:** 2026-02-01 (initial), updated 2026-02-02
 **Feature branch:** uncommitted changes on `master`
-**Scope:** New activation patching / causal intervention capability for the Granite 4.0 Mamba-2 interpretability suite
+**Scope:** Causal intervention (activation patching), circuit discovery (path patching), shared base class refactor, Plotly visualizations, hardening, and expanded test coverage
 
-This document covers what was built, key design decisions, a critical analysis of how activation patching interacts with Mamba's recurrent state, and an audit of issues to address.
+This document covers what was built, key design decisions, a critical analysis of how activation patching interacts with Mamba's recurrent state, and an audit of remaining issues.
 
 **Assumes:** Familiarity with PyTorch hooks, forward passes, and basic neural network architecture. Interpretability-specific concepts are explained inline.
 
@@ -12,90 +12,156 @@ This document covers what was built, key design decisions, a critical analysis o
 
 ## Table of Contents
 
-1. [Summary of Uncommitted Changes](#1-summary-of-uncommitted-changes)
+1. [Summary of Changes](#1-summary-of-changes)
 2. [Discussion Points](#2-discussion-points)
 3. [Mamba vs Transformer Causal Roles — The Critical Finding](#3-mamba-vs-transformer-causal-roles--the-critical-finding)
 4. [Audit Findings](#4-audit-findings)
-5. [Recommended Next Steps](#5-recommended-next-steps)
+5. [Remaining Issues](#5-remaining-issues)
 
 ---
 
-## 1. Summary of Uncommitted Changes
+## 1. Summary of Changes
 
-Four files are affected: one new extraction module, one new visualization module, one new test file, and modifications to the Gradio app.
+Nine files are affected across three categories: extraction engines, visualizations, and tests.
 
-### 1.1 `src/extraction/causal_intervention.py` (new, ~420 lines)
+### 1.1 `src/extraction/intervention_base.py` (new, 180 lines)
 
-This is the core engine. It implements **activation patching** — a technique from mechanistic interpretability where you:
-
-1. Run a "clean" prompt (one that should produce the correct answer) and cache the model's internal activations at every layer
-2. Run a "corrupted" prompt (one that produces the wrong answer) but intervene at a specific layer by swapping in the clean activations
-3. Measure whether the correct answer is recovered — if so, that layer is causally responsible
+Shared base class extracted from duplicated code in `CausalInterventionEngine` and `CircuitDiscoveryEngine`. Both engines now inherit from `InterventionBase`.
 
 **Key components:**
 
-- `InterventionType` enum (line 23) — four intervention modes:
-  - `ACTIVATION_PATCH` — replace corrupted activations with clean values
-  - `ZERO_ABLATION` — set activations to zero (tests necessity)
-  - `MEAN_ABLATION` — replace with sequence-mean (tests specificity)
-  - `NOISE` — add Gaussian noise (tests robustness)
+- `MAX_SEQ_LEN = 256` and `MIN_RECOVERY_DENOMINATOR = 1e-6` — constants formerly hardcoded in multiple places
+- `InterventionBase.__init__()` — validates model/tokenizer/arch_map are not None, stores references, initializes `_prompt_cache`
+- `resolve_token(text)` — converts token text to ID, handles space-prefix tokenization, warns on multi-token splits
+- `run_and_cache(prompt)` — single forward pass with hooks on embedding + all 32 layers, caches `{residual_stream, embedding, logits, tokens}` per prompt
+- `clear_cache()` — evicts the internal prompt cache
+- `_get_logit_diff(logits, correct_id, incorrect_id)` — computes logit difference at last position
+- `_compute_baselines(clean_cache, corrupted_cache, correct_id, incorrect_id)` — computes clean/corrupted logit diffs, denominator, and probabilities
+- `_compute_layer_output(prompt)` — computes isolated per-layer contributions to the residual stream (layer L output = residual after L − residual before L)
 
-- `SweepResult` dataclass (line 32) — holds all results from a sweep: token lists, baseline logit diffs, probabilities, and the recovery matrix (1D for layer sweep, 2D for full position x layer sweep)
+### 1.2 `src/extraction/causal_intervention.py` (modified, 321 lines — down from ~420)
 
-- `CausalInterventionEngine` class (line 56):
-  - `resolve_token(text)` (line 72) — converts a token string like "Paris" to a token ID, handling the space-prefix tokenization issue where `"Paris"` and `" Paris"` may produce different IDs
-  - `run_and_cache(prompt)` (line 95) — single forward pass with read-only hooks on all 32 layers, caches residual stream outputs to `self._prompt_cache`
-  - `run_with_intervention(prompt, intervention_type, target_layer, positions, clean_cache)` (line 151) — single forward pass with a write hook on one layer that modifies the output tensor according to `intervention_type`
-  - `sweep_layers(...)` (line 265) — patches all positions at each layer in turn (32 forward passes), producing a 1D recovery vector answering "which layers matter?"
-  - `sweep_positions_and_layers(...)` (line 344) — patches one position at one layer at a time (32 x seq_len forward passes), producing a 2D heatmap
+Now inherits from `InterventionBase`. The duplicated `resolve_token`, `run_and_cache`, `clear_cache`, baseline computation, and constant definitions have been removed.
 
-- **Recovery formula** (lines 317-318):
-  ```
-  recovery = (patched_logit_diff - corrupted_logit_diff) / (clean_logit_diff - corrupted_logit_diff)
-  ```
-  Where `logit_diff = logit[correct_token] - logit[incorrect_token]`. A recovery of 1.0 means the intervention fully restored the correct answer; 0.0 means no effect. Values above 1.0 or below 0.0 are possible and meaningful (overcorrection or further damage).
+**Retained components:**
 
-### 1.2 `src/visualization/intervention_viz.py` (new, ~287 lines)
+- `InterventionType` enum — four modes: `ACTIVATION_PATCH`, `ZERO_ABLATION`, `MEAN_ABLATION`, `NOISE`
+- `SweepResult` dataclass — recovery matrix (1D or 2D), token lists, baseline metrics
+- `CausalInterventionEngine` — now only contains intervention-specific logic:
+  - `run_with_intervention()` — forward pass with a write hook on one layer
+  - `sweep_layers()` — 1D sweep (32 forward passes)
+  - `sweep_positions_and_layers()` — 2D sweep (32 × seq_len forward passes)
 
-Two dashboard layouts:
+**Recovery formula** (unchanged):
+```
+recovery = (patched_logit_diff - corrupted_logit_diff) / (clean_logit_diff - corrupted_logit_diff)
+```
 
-- `create_layer_sweep_dashboard()` (line 9) — 2-panel figure: bar chart of recovery per layer (purple for Mamba, teal for Transformer) with background shading by layer type, plus a text panel showing baselines and top-5 layers
-- `create_full_sweep_dashboard()` (line 29) — 2x2 figure: position-by-layer heatmap (diverging RdBu colormap centered at 0), per-layer marginal bar chart, per-position marginal bar chart, and summary statistics
-- `format_intervention_info()` (line 246) — text summary for the Gradio info panel
-- `_truncate_token()` (line 277) — strips HuggingFace tokenizer prefixes (`"▁"`, `"Ġ"`) for cleaner display
+### 1.3 `src/extraction/circuit_discovery.py` (modified, 672 lines)
 
-Notable: the Mamba cascade annotation at line 98 warns users that "Mamba layers propagate state sequentially — patching cascades to later positions, which may yield higher recovery than Transformer layers." This foreshadows the deeper issue discussed in Section 3.
+Now inherits from `InterventionBase`. Implements circuit discovery via path patching — tracing information flow between specific pairs of layers rather than patching one layer at a time.
 
-### 1.3 `tests/test_intervention.py` (new, ~523 lines)
+**Key components:**
 
-Tests organized into groups:
+- `SweepGranularity` enum — `FAST` (layer paths only) or `DETAILED` (layer paths + component-level)
+- `PathPatchResult`, `ComponentResult`, `CircuitNode`, `CircuitEdge`, `CircuitResult` — data classes for structured results
+- `CircuitDiscoveryEngine`:
+  - `run_with_layer_patch(prompt, target_layer, replacement_output)` — patches one layer's output with a computed tensor (for path patching)
+  - `_path_patch_single(source, target, ...)` — patches the connection between two specific layers
+  - `_patch_attention_head(layer_idx, head_idx, ...)` — patches a single attention head within a Transformer layer
+  - `sweep_paths(...)` — O(n²/2) sweep of all source→target layer pairs, produces [num_layers × num_layers] importance matrix
+  - `sweep_components(...)` — sweeps individual attention heads within important Transformer layers
+  - `_extract_circuit(...)` — thresholds the path matrix and component results to extract nodes and edges
+  - `find_circuit(...)` — top-level method combining layer importance, path patching, optional component patching, and circuit extraction
+  - All sweep methods accept `progress_callback` for UI integration
 
-| Group | What's tested |
-|-------|---------------|
-| `InterventionType` enum | String values, construction from strings |
-| Recovery score math | Full recovery (1.0), no recovery (0.0), partial, zero denominator |
-| `SweepResult` dataclass | 1D and 2D recovery matrices |
-| Hook logic simulation | All 4 intervention types tested on raw tensors |
-| Mock engine fixture | Realistic mock with tokenizer, model layers, arch_map |
-| `resolve_token` | Single token, multi-token warning, empty input error, display format |
-| Hook lifecycle | Cleanup after success, cleanup after exception |
-| Caching | Cache hit, cache miss, cache clearing |
-| Position handling | Out-of-bounds filtering, empty positions, mismatched seq_len |
-| Numerical edge cases | bfloat16 precision, small denominators, NaN/Inf prevention |
-| Integration-style | Sweep forward pass count, progress callback, result shapes |
+### 1.4 `src/visualization/circuit_viz.py` (modified, 751 lines — up from ~170)
 
-**Coverage gap:** `sweep_positions_and_layers` has zero direct test coverage. See audit finding 5.2.1.
+Added Plotly-based interactive visualizations for the Gradio tabbed UI alongside the existing matplotlib dashboard.
 
-### 1.4 `app.py` modifications (+147/-10 lines)
+**New Plotly functions:**
 
-- New imports for `CausalInterventionEngine`, `InterventionType`, and viz functions (lines 23-28)
-- New globals `INTERVENTION_ENGINE` and `INTERVENTION_CACHE` (lines 37-38)
-- Engine initialized in `initialize()` sharing the same `MODEL`, `TOKENIZER`, and `ARCH_MAP` (line 52)
-- `intervention_view()` function (line 261) — validates inputs, checks cache, dispatches to layer or full sweep, returns figure + info text
-- Five new Gradio controls: correct/incorrect token text inputs, token resolution display, intervention type radio, sweep mode radio — all hidden unless "Causal Intervention" view mode is selected
-- Real-time token resolution via `.change()` callbacks on the token inputs (lines 455-469)
-- "Comparison Prompt" renamed to "Comparison / Corrupted Prompt" since it's now shared between Activation Diff and Causal Intervention modes
-- Security: `share=False` and `server_name="127.0.0.1"` replaces `share=True` and `0.0.0.0`
+- `create_path_matrix_plotly(result, arch_map)` — interactive heatmap of the [num_layers × num_layers] path importance matrix, with layer type annotations
+- `create_layer_importance_plotly(result, arch_map)` — bar chart of per-layer importance scores, color-coded by Mamba vs Transformer
+- `create_circuit_diagram_plotly(result, arch_map)` — network-style diagram showing discovered circuit nodes and edges, filters to top-N nodes
+- `create_component_importance_plotly(result, arch_map)` — grid of per-head importance for Transformer layers that were component-swept
+- `create_circuit_summary_markdown(result, arch_map)` — markdown text summary of circuit statistics and top nodes/edges
+
+All Plotly functions handle `None` inputs gracefully (return empty figures with instructional text).
+
+**Existing matplotlib functions** (unchanged):
+
+- `create_circuit_dashboard(result, arch_map)` — multi-panel static figure
+- `format_circuit_info(result)` — text summary for the info panel
+
+### 1.5 `app.py` (modified, 762 lines)
+
+**Circuit discovery UI overhaul:**
+
+- `circuit_discovery_view()` now returns `(circuit_result, info)` instead of `(fig, info)` — the raw result object is passed to individual Plotly renderers
+- New tabbed output panel for Circuit Discovery mode with 5 tabs: Path Matrix, Layer Importance, Circuit Diagram, Components, Summary
+- `single_plot_wrapper` and `circuit_output_wrapper` toggle visibility based on view mode
+- `_default_circuit_outputs()` helper returns default `gr.update()` values for the 7 circuit-specific output slots
+- `analyze()` function now accepts `progress=gr.Progress(track_tqdm=False)` and returns 10 outputs instead of 3
+
+**Hardening fixes:**
+
+- Null guards on both `INTERVENTION_ENGINE` and `CIRCUIT_ENGINE` — return friendly error messages if initialization failed
+- `INTERVENTION_CACHE` bounded to 20 entries with oldest-first eviction
+- `CIRCUIT_CACHE` bounded to 10 entries with oldest-first eviction
+- Input stripping moved to the top of both view functions (strip once, use everywhere)
+- Progress callbacks wired for both circuit discovery (`cd_progress`) and causal intervention (`iv_progress`) via `gr.Progress`
+
+### 1.6 `tests/test_intervention.py` (modified, 736 lines — up from ~523)
+
+**New tests for `sweep_positions_and_layers`** (formerly zero coverage):
+
+| Test | What it verifies |
+|------|------------------|
+| `test_full_sweep_result_shape` | Recovery matrix is 2D `[num_layers, seq_len]` |
+| `test_full_sweep_forward_pass_count` | Exactly `num_layers × seq_len` forward passes |
+| `test_full_sweep_progress_callback` | Callback fired with monotonically increasing steps |
+| `test_full_sweep_layer_subset` | `layer_subset` parameter reduces sweep scope |
+| `test_full_sweep_each_call_patches_single_position` | Each call patches exactly one position |
+| `test_full_sweep_no_nan_inf` | No NaN or Inf in recovery matrix |
+| `test_full_sweep_populates_sweep_result_fields` | All SweepResult fields populated correctly |
+
+Also added: `test_residual_stream_has_only_integer_keys` verifying cache structure.
+
+### 1.7 `tests/test_circuit_discovery.py` (modified, 783 lines — up from ~193)
+
+Comprehensive test suite covering:
+
+- Data class construction and validation for all 5 circuit data types
+- Constructor validation (rejects None model/tokenizer/arch_map)
+- `resolve_token` via inheritance from `InterventionBase`
+- Circuit extraction: empty below threshold, finds important nodes, finds edges, includes components
+- Path patching: source ≥ target returns zero, equal layers return zero
+- Attention head patching: returns zero for Mamba layers, returns zero when no `self_attn`
+- Hook lifecycle: cleanup on success and on exception
+- Caching: hit, miss, clear
+- `run_with_layer_patch`: returns logits, hook cleanup on success and exception
+- `sweep_paths`: correct shapes, forward pass counts, upper-triangle fill, progress callback
+- `sweep_components`: only sweeps Transformer layers, filters by important layers, progress callback, one clean pass per layer
+- `find_circuit`: fast mode, detailed mode calls components, detailed progress monotonic, empty tokens raises
+- `_compute_layer_output`: per-layer contributions, layer 0 uses embedding
+- `_patch_attention_head`: returns zero when no `self_attn` attribute
+
+### 1.8 `tests/test_circuit_viz.py` (modified, 231 lines — up from ~150)
+
+Added tests for all Plotly visualization functions:
+
+- `test_path_matrix_plotly_returns_figure`
+- `test_layer_importance_plotly_returns_figure`
+- `test_circuit_diagram_plotly_returns_figure`
+- `test_circuit_diagram_plotly_filters_top_n`
+- `test_component_importance_plotly_returns_figure` / `_empty`
+- `test_circuit_summary_markdown_returns_string`
+- `test_plotly_functions_handle_none`
+
+### 1.9 `requirements.txt` (modified)
+
+Added `plotly` dependency for the new interactive visualizations.
 
 ---
 
@@ -103,13 +169,13 @@ Tests organized into groups:
 
 ### 2.1 Tokenizer Reuse
 
-No custom tokenizer was written. The `CausalInterventionEngine` receives the existing HuggingFace tokenizer instance from `initialize()` and calls standard methods: `.encode()`, `.decode()`, `.__call__()`, `.convert_ids_to_tokens()`.
+No custom tokenizer was written. The `InterventionBase` (and by inheritance both engines) receives the existing HuggingFace tokenizer instance from `initialize()` and calls standard methods: `.encode()`, `.decode()`, `.__call__()`, `.convert_ids_to_tokens()`.
 
-The `resolve_token()` method (line 72) is a thin wrapper that:
+The `resolve_token()` method is a thin wrapper that:
 1. Tokenizes the input text
 2. Takes the last sub-token if the word splits into multiple tokens (e.g., "Warsaw" might become `["War", "saw"]`)
 3. Issues a warning if multi-token splitting occurs
-4. Returns a display string showing the exact resolution (e.g., `"Paris" -> token 1234 ("Paris")`) so users can verify the tokenization is correct
+4. Returns a display string showing the exact resolution (e.g., `"Paris" → token 1234 ("Paris")`) so users can verify the tokenization is correct
 
 This matters because activation patching measures the logit difference between a "correct" and "incorrect" token. If those tokens are resolved incorrectly (e.g., getting the first sub-token instead of the last), the recovery scores are meaningless.
 
@@ -125,13 +191,22 @@ The visualization already color-codes layer types, making these comparisons imme
 
 ### 2.3 Research Directions
 
-**Path patching:** Instead of patching an entire layer, patch the *connection between two specific layers*. This traces information flow through the computation graph — e.g., "factual knowledge flows from Mamba layer 8 through Transformer layer 10's attention heads to the output."
+**Path patching (now implemented):** Instead of patching an entire layer, patch the *connection between two specific layers*. This traces information flow through the computation graph — e.g., "factual knowledge flows from Mamba layer 8 through Transformer layer 10's attention heads to the output." The `sweep_paths()` method produces a full [num_layers × num_layers] importance matrix showing all pairwise connections.
+
+**Component-level patching (now implemented):** The 4 Transformer layers each have multiple attention heads. The `sweep_components()` method patches individual heads to identify which specific heads perform factual recall.
 
 **Indirect vs direct effects:** The current sweep conflates two things: a layer's direct effect on the output logits, and its indirect effect through downstream layers. Decomposing these requires patching layer L and measuring the change at each subsequent layer, not just at the final output.
 
-**Head-level patching for Transformer layers:** The 4 Transformer layers each have multiple attention heads. Patching individual heads (rather than the full layer) would identify which specific heads perform factual recall. This complements the existing head-level attention visualization.
-
 **Cross-referencing with hidden attention:** The existing extraction tools compute Mamba hidden attention patterns (the implicit attention matrix derived from dt, B, C parameters). Comparing these patterns with causal intervention results could reveal whether "attending to" a token (high attention weight) corresponds to being "causally responsible" for the output (high recovery score). Mismatches would be particularly interesting.
+
+### 2.4 InterventionBase Refactor
+
+The original `CausalInterventionEngine` and `CircuitDiscoveryEngine` duplicated ~150 lines of identical code: token resolution, forward-pass caching with hooks, logit diff computation, and baseline calculation. These were extracted into `InterventionBase`.
+
+Design decisions:
+- **Inheritance over composition** — both engines *are* intervention runners with shared state (`_prompt_cache`, model references). Composition would have required forwarding every method call.
+- **Constants at module level** — `MAX_SEQ_LEN` and `MIN_RECOVERY_DENOMINATOR` are importable from `intervention_base` so tests can reference them without magic numbers.
+- **`_compute_layer_output()` in base** — used by circuit discovery for path patching (computing the isolated contribution of source layers). Placed in base because it only depends on `run_and_cache()`.
 
 ---
 
@@ -142,7 +217,7 @@ The visualization already color-codes layer types, making these comparisons imme
 The intervention hooks register on `model.model.layers[layer_idx]`, which is a `GraniteMoeHybridDecoderLayer` wrapper. Regardless of whether the inner sublayer is Mamba or Transformer, this wrapper always outputs a single tensor (the residual stream hidden state). The hook code correctly handles both cases:
 
 ```python
-# causal_intervention.py:122-127 (read hook)
+# intervention_base.py:95-100 (read hook)
 def hook_fn(module, input, output, _idx=layer_idx):
     if isinstance(output, tuple):
         hidden = output[0]
@@ -215,90 +290,64 @@ The existing annotation in the visualization (`intervention_viz.py:98-109`) part
 
 ## 4. Audit Findings
 
-### 4.1 Critical
+### 4.1 Critical (unchanged)
 
 **Mamba SSM state not patched during intervention**
-- **Where:** `causal_intervention.py:176-216` (the `make_intervention_hook` closure)
+- **Where:** `causal_intervention.py` — the `make_intervention_hook` closure
 - **What:** The hook modifies the decoder layer's output tensor but cannot access or modify the Mamba layer's internal `conv_states` and `ssm_states`
 - **Impact:** Recovery scores for 28 of 32 layers (all Mamba layers) may be systematically inaccurate. Cross-layer-type comparisons are confounded.
 - **Why it matters:** This is the core measurement the tool produces. If it's systematically biased for the majority of layers, users may draw incorrect conclusions about which layers store factual knowledge.
 
-### 4.2 High
+### 4.2 Resolved Issues
 
-**4.2.1 `sweep_positions_and_layers` has zero test coverage**
-- **Where:** `tests/test_intervention.py` — no `test_sweep_positions_and_layers_*` functions exist
-- **What:** The most expensive method (N_layers x seq_len forward passes, potentially 32 x 50+ = 1600 calls) is completely untested
-- **Why it matters:** This is the code path most likely to have edge cases (2D indexing, position-layer iteration order). It also produces the full heatmap — the most complex visualization.
+The following issues from the original audit have been addressed:
 
-**4.2.2 `INTERVENTION_CACHE` grows without bound**
-- **Where:** `app.py:38` (declaration), `app.py:303` (writes)
-- **What:** Each `SweepResult` stores a recovery matrix (up to `[32, seq_len]` floats), two token lists, and several scalars. The cache is never evicted.
-- **Why it matters:** With varied inputs over a long session, memory usage grows indefinitely. The existing `CACHE` and `MULTISTEP_CACHE` have the same issue, but intervention results tend to be larger due to the 2D matrix.
-
-**4.2.3 `INTERVENTION_ENGINE` null checks missing**
-- **Where:** `app.py:261` (`intervention_view` function), `app.py:455-469` (`update_token_info` closure)
-- **What:** If `initialize()` fails or hasn't completed, `INTERVENTION_ENGINE` is `None`. Both `intervention_view()` and the token resolution callback will raise `AttributeError`.
-- **Why it matters:** Initialization failures should show a user-friendly error, not a stack trace.
-
-**4.2.4 Thread-safety on `_prompt_cache`**
-- **Where:** `causal_intervention.py:70` (declaration), lines 107-108 and 144 (read/write)
-- **What:** `_prompt_cache` is a plain dict. Gradio can dispatch concurrent requests, and two threads could race on checking and populating the same cache key.
-- **Why it matters:** Race conditions could cause duplicate computation (wasteful) or, worse, one thread reading a partially-written cache entry (crash or corrupted results).
-
-### 4.3 Medium
-
-**4.3.1 `noise_std` not calibrated to activation magnitudes**
-- **Where:** `causal_intervention.py:159` (parameter default), line 211 (usage)
-- **What:** The default `noise_std=1.0` is arbitrary. Depending on the model's activation scale, this could be negligibly small (if activations have magnitude ~100) or overwhelmingly large (if activations are ~0.01).
-- **Why it matters:** The noise intervention is meant to test "how robust is this layer's computation to perturbation?" If the noise magnitude is miscalibrated, the answer is always "very robust" (noise too small) or "not at all" (noise too large).
-
-**4.3.2 Zero denominator silently masked as recovery = 0.0**
-- **Where:** `causal_intervention.py:317-320`, lines 394-397
-- **What:** When `clean_logit_diff == corrupted_logit_diff` (denominator < 1e-6), recovery is set to 0.0. No warning is logged.
-- **Why it matters:** This condition means the clean and corrupted prompts produce the same logit difference for the target tokens — the experiment is not well-posed. The user should know this, not see a silent 0.0 that looks like "no layer matters."
-
-**4.3.3 Progress callbacks not wired in the UI**
-- **Where:** `app.py:289-302` (`intervention_view` function)
-- **What:** Both sweep methods accept a `progress_callback` parameter, but the app never passes one.
-- **Why it matters:** The full sweep can require 1000+ forward passes. With no progress indication, users may think the app has frozen.
-
-**4.3.4 Special token handling in visualization**
-- **Where:** `intervention_viz.py:280-285` (`_truncate_token`)
-- **What:** Strips `"▁"` and `"Ġ"` prefixes but doesn't handle other special tokens (`<s>`, `</s>`, `<pad>`). A token like `"▁"` alone becomes an empty string after stripping.
-- **Why it matters:** Empty labels on heatmap axes are confusing. Special tokens appearing as raw strings (`<s>`) look like HTML in some renderers.
-
-### 4.4 Low
-
-**4.4.1 Magic number `1e-6` hardcoded in two places**
-- **Where:** `causal_intervention.py:317` and `causal_intervention.py:394`
-- **What:** The denominator threshold is a bare literal in both `sweep_layers` and `sweep_positions_and_layers`.
-- **Suggestion:** Extract to a class constant like `DENOMINATOR_THRESHOLD = 1e-6`.
-
-**4.4.2 Empty `__init__.py` exports**
-- **Where:** `src/extraction/__init__.py`, `src/visualization/__init__.py`
-- **What:** These are empty files. Users must use full import paths like `from src.extraction.causal_intervention import CausalInterventionEngine`.
-- **Suggestion:** Adding `__all__` exports would improve discoverability, though this is stylistic and the current approach works fine.
+| Issue | Resolution |
+|-------|------------|
+| **`sweep_positions_and_layers` zero test coverage** (was 4.2.1) | 7 new tests added: shape, forward pass count, progress callback, layer subset, single-position patching, NaN/Inf, field population |
+| **`INTERVENTION_CACHE` grows without bound** (was 4.2.2) | Bounded to 20 entries (`INTERVENTION_CACHE_MAX`), oldest-first eviction at `app.py:321-323` |
+| **`CIRCUIT_CACHE` grows without bound** (was 4.2.2) | Bounded to 10 entries (`CIRCUIT_CACHE_MAX`), oldest-first eviction at `app.py:374-376` |
+| **`INTERVENTION_ENGINE` null checks missing** (was 4.2.3) | Null guard at `app.py:279` — returns friendly error |
+| **`CIRCUIT_ENGINE` null checks missing** (was 4.2.3) | Null guard at `app.py:338` — returns friendly error |
+| **Progress callbacks not wired in UI** (was 4.3.3) | Circuit discovery wired at `app.py:649-655`, causal intervention wired at `app.py:695-697`, both use `gr.Progress` |
+| **Magic number `1e-6` hardcoded** (was 4.4.1) | Extracted to `MIN_RECOVERY_DENOMINATOR` constant in `intervention_base.py:17` |
 
 ---
 
-## 5. Recommended Next Steps
+## 5. Remaining Issues
 
-Ordered by priority. Items 1-5 are concrete fixes; items 6-9 are enhancements.
+### 5.1 High
 
-1. **Add tests for `sweep_positions_and_layers`** — This is the biggest test gap. At minimum: verify the result shape is 2D `[num_layers, seq_len]`, verify the correct number of forward passes, and test the progress callback.
+**Thread-safety on `_prompt_cache`**
+- **Where:** `intervention_base.py:35` (declaration), lines 72-73 and 118 (read/write)
+- **What:** `_prompt_cache` is a plain dict. Gradio can dispatch concurrent requests, and two threads could race on checking and populating the same cache key.
+- **Why it matters:** Race conditions could cause duplicate computation (wasteful) or, worse, one thread reading a partially-written cache entry (crash or corrupted results).
 
-2. **Add a warning when the denominator is near zero** — Log a warning or return a special message in the info panel when `clean_logit_diff ~= corrupted_logit_diff`. This helps users catch ill-posed experiments.
+### 5.2 Medium
 
-3. **Wire progress callbacks in the UI** — Gradio supports `gr.Progress`. Passing a callback to the sweep methods would show a progress bar during long runs.
+**`CACHE` and `MULTISTEP_CACHE` grow without bound**
+- **Where:** `app.py:45-46`
+- **What:** The original extraction cache and multi-step generation cache have no size limits, unlike the now-bounded intervention and circuit caches.
+- **Why it matters:** Long sessions with varied inputs will accumulate memory indefinitely.
 
-4. **Add `INTERVENTION_ENGINE` null guard** — Check for `None` in `intervention_view()` and `update_token_info()`, return a friendly error message.
+**`noise_std` not calibrated to activation magnitudes**
+- **Where:** `causal_intervention.py` — noise intervention hook
+- **What:** The default `noise_std=1.0` is arbitrary. Depending on the model's activation scale, this could be negligibly small or overwhelmingly large.
+- **Why it matters:** The noise intervention is meant to test robustness. Miscalibrated noise makes the results uninformative.
 
-5. **Add cache eviction** — Implement a max-size limit on `INTERVENTION_CACHE` (and ideally the other caches too). An LRU strategy with a configurable cap would prevent unbounded memory growth.
+**Zero denominator silently masked as recovery = 0.0**
+- **Where:** Recovery computation in `causal_intervention.py`
+- **What:** When `clean_logit_diff == corrupted_logit_diff` (denominator < `MIN_RECOVERY_DENOMINATOR`), recovery is set to 0.0 with no warning.
+- **Why it matters:** This condition means the experiment is ill-posed (clean and corrupted prompts produce the same logit difference). Users should be informed, not shown a silent 0.0.
 
-6. **Document the SSM limitation in the UI** — The existing annotation in the bar chart (intervention_viz.py:98-109) is a start. Consider adding a more prominent note in the Gradio info panel when Mamba-layer recovery scores are displayed.
+### 5.3 Low
 
-7. **Calibrate `noise_std`** — Compute the actual activation norm at each layer and scale noise relative to it (e.g., `noise_std = 0.5 * activation_norm`). This makes the noise intervention actually informative.
+**Special token handling in visualization**
+- **Where:** `intervention_viz.py` — `_truncate_token()`
+- **What:** Strips `"▁"` and `"Ġ"` prefixes but doesn't handle `<s>`, `</s>`, `<pad>`. A bare `"▁"` becomes an empty string.
+- **Why it matters:** Empty labels on heatmap axes are confusing.
 
-8. **Extract the `1e-6` threshold to a named constant** — Minor cleanup for consistency and discoverability.
-
-9. **Research: prototype SSM-state-level patching** — Long-term. Would require hooking into the Mamba layer's internal submodules to capture and restore `conv_states` and `ssm_states`. This would make Mamba recovery scores trustworthy and enable fair cross-layer-type comparison.
+**Empty `__init__.py` exports**
+- **Where:** `src/extraction/__init__.py`, `src/visualization/__init__.py`
+- **What:** Empty files; users must use full import paths.
+- **Why it matters:** Stylistic only. Current approach works fine.

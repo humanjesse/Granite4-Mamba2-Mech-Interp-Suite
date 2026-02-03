@@ -158,21 +158,29 @@ def test_mean_ablation_hook():
 
 
 def test_activation_patch_hook():
-    """Activation patching should replace corrupted with clean values."""
-    corrupted = torch.randn(1, 5, 8)
-    clean = torch.randn(1, 5, 8)
+    """Activation patching should swap isolated layer contributions, not full residual."""
+    corrupted_output = torch.randn(1, 5, 8)
+    clean_contrib = torch.randn(1, 5, 8)
+    corrupt_contrib = torch.randn(1, 5, 8)
     positions = [0, 4]
 
-    modified = corrupted.clone()
+    # Simulate the delta-based hook logic
+    modified = corrupted_output.clone()
     idx = torch.tensor(positions)
-    modified[:, idx, :] = clean[:, idx, :]
+    modified[:, idx, :] = (
+        corrupted_output[:, idx, :]
+        - corrupt_contrib[:, idx, :]
+        + clean_contrib[:, idx, :]
+    )
 
-    assert torch.allclose(modified[:, 0, :], clean[:, 0, :])
-    assert torch.allclose(modified[:, 4, :], clean[:, 4, :])
+    # Patched positions should have the delta applied
+    expected = corrupted_output[:, idx, :] - corrupt_contrib[:, idx, :] + clean_contrib[:, idx, :]
+    assert torch.allclose(modified[:, 0, :], expected[:, 0, :])
+    assert torch.allclose(modified[:, 4, :], expected[:, 1, :])
     # Non-patched positions should retain corrupted values
-    assert torch.allclose(modified[:, 1, :], corrupted[:, 1, :])
-    assert torch.allclose(modified[:, 2, :], corrupted[:, 2, :])
-    assert torch.allclose(modified[:, 3, :], corrupted[:, 3, :])
+    assert torch.allclose(modified[:, 1, :], corrupted_output[:, 1, :])
+    assert torch.allclose(modified[:, 2, :], corrupted_output[:, 2, :])
+    assert torch.allclose(modified[:, 3, :], corrupted_output[:, 3, :])
 
 
 def test_noise_hook():
@@ -287,20 +295,25 @@ def test_resolve_token_display_format(mock_engine):
 # ---- Test hook lifecycle ----
 
 def test_run_and_cache_hook_cleanup(mock_engine):
-    """All hooks should be removed after run_and_cache completes."""
+    """All hooks (embedding + layers) should be removed after run_and_cache completes."""
     mock_output = _make_mock_model_output()
     mock_engine.model.return_value = mock_output
 
-    handles = []
+    embed_handle = MagicMock()
+    embed_handle.remove = MagicMock()
+    mock_engine.model.model.embed_tokens.register_forward_hook = MagicMock(return_value=embed_handle)
+
+    layer_handles = []
     for layer in mock_engine.model.model.layers:
         handle = MagicMock()
         handle.remove = MagicMock()
         layer.register_forward_hook = MagicMock(return_value=handle)
-        handles.append(handle)
+        layer_handles.append(handle)
 
     mock_engine.run_and_cache("test prompt")
 
-    for handle in handles:
+    embed_handle.remove.assert_called_once()
+    for handle in layer_handles:
         handle.remove.assert_called_once()
 
 
@@ -327,17 +340,22 @@ def test_hook_cleanup_on_exception(mock_engine):
     """Hooks should be removed even if the forward pass raises."""
     mock_engine.model.side_effect = RuntimeError("forward pass failed")
 
-    handles = []
+    embed_handle = MagicMock()
+    embed_handle.remove = MagicMock()
+    mock_engine.model.model.embed_tokens.register_forward_hook = MagicMock(return_value=embed_handle)
+
+    layer_handles = []
     for layer in mock_engine.model.model.layers:
         handle = MagicMock()
         handle.remove = MagicMock()
         layer.register_forward_hook = MagicMock(return_value=handle)
-        handles.append(handle)
+        layer_handles.append(handle)
 
     with pytest.raises(RuntimeError, match="forward pass failed"):
         mock_engine.run_and_cache("test prompt")
 
-    for handle in handles:
+    embed_handle.remove.assert_called_once()
+    for handle in layer_handles:
         handle.remove.assert_called_once()
 
 
@@ -469,29 +487,40 @@ def _setup_sweep_mocks(mock_engine, vocab_size=2000):
     mock_engine.tokenizer.decode.side_effect = lambda tid: {10: "Paris", 20: "Warsaw"}.get(tid, "?")
 
 
+def _make_fake_contributions(num_layers, seq_len=3, hidden_dim=32):
+    """Create fake per-layer contribution dicts for sweep tests."""
+    return {i: torch.randn(1, seq_len, hidden_dim) for i in range(num_layers)}
+
+
 def test_sweep_layers_calls_correct_number_of_forward_passes(mock_engine):
     """sweep_layers should call run_with_intervention once per layer."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         result = mock_engine.sweep_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
             correct_token="Paris",
             incorrect_token="Warsaw",
         )
-        assert mock_rwi.call_count == mock_engine.arch_map.num_layers
+        assert mock_rwi.call_count == num_layers
 
 
 def test_sweep_layers_progress_callback(mock_engine):
     """Progress callback should be called num_layers times."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
     callback_calls = []
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         mock_engine.sweep_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -508,9 +537,12 @@ def test_sweep_layers_progress_callback(mock_engine):
 def test_sweep_result_shapes(mock_engine):
     """Layer sweep should return a 1D recovery matrix of shape [num_layers]."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         result = mock_engine.sweep_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -528,9 +560,12 @@ def test_sweep_result_shapes(mock_engine):
 def test_full_sweep_result_shape(mock_engine):
     """sweep_positions_and_layers should return a 2D [num_layers, seq_len] matrix."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         result = mock_engine.sweep_positions_and_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -549,16 +584,18 @@ def test_full_sweep_result_shape(mock_engine):
 def test_full_sweep_forward_pass_count(mock_engine):
     """sweep_positions_and_layers should call run_with_intervention num_layers * seq_len times."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         mock_engine.sweep_positions_and_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
             correct_token="Paris",
             incorrect_token="Warsaw",
         )
-        num_layers = mock_engine.arch_map.num_layers
         seq_len = 3
         assert mock_rwi.call_count == num_layers * seq_len
 
@@ -566,10 +603,13 @@ def test_full_sweep_forward_pass_count(mock_engine):
 def test_full_sweep_progress_callback(mock_engine):
     """Progress callback should be called num_layers * seq_len times with correct totals."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
     callback_calls = []
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         mock_engine.sweep_positions_and_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -589,9 +629,12 @@ def test_full_sweep_progress_callback(mock_engine):
 def test_full_sweep_layer_subset(mock_engine):
     """layer_subset should limit which layers are swept."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         result = mock_engine.sweep_positions_and_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -608,9 +651,12 @@ def test_full_sweep_layer_subset(mock_engine):
 def test_full_sweep_each_call_patches_single_position(mock_engine):
     """Each run_with_intervention call should patch exactly one position."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         mock_engine.sweep_positions_and_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -630,9 +676,12 @@ def test_full_sweep_each_call_patches_single_position(mock_engine):
 def test_full_sweep_no_nan_inf(mock_engine):
     """Full sweep recovery scores should not contain NaN or Inf."""
     _setup_sweep_mocks(mock_engine)
+    num_layers = mock_engine.arch_map.num_layers
 
-    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi:
+    with patch.object(mock_engine, 'run_with_intervention') as mock_rwi, \
+         patch.object(mock_engine, '_compute_layer_output') as mock_clo:
         mock_rwi.return_value = torch.randn(1, 3, 2000)
+        mock_clo.return_value = _make_fake_contributions(num_layers)
         result = mock_engine.sweep_positions_and_layers(
             clean_prompt="The capital of France is",
             corrupted_prompt="The capital of Poland is",
@@ -669,3 +718,19 @@ def test_full_sweep_populates_sweep_result_fields(mock_engine):
     assert isinstance(result.corrupted_prob_correct, float)
     assert len(result.clean_tokens) == 3
     assert len(result.corrupted_tokens) == 3
+
+
+# ---- Test residual_stream key types ----
+
+def test_residual_stream_has_only_integer_keys(mock_engine):
+    """residual_stream should contain only integer keys; embedding is stored separately."""
+    mock_output = _make_mock_model_output()
+    mock_engine.model.return_value = mock_output
+
+    result = mock_engine.run_and_cache("test prompt")
+
+    for key in result["residual_stream"]:
+        assert isinstance(key, int), f"Expected int key, got {type(key).__name__}: {key}"
+    # "embedding" must exist as a top-level key, not inside residual_stream
+    assert "embedding" in result
+    assert "embedding" not in result["residual_stream"]

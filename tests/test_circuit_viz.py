@@ -17,7 +17,13 @@ from src.extraction.circuit_discovery import (
 from src.visualization.circuit_viz import (
     create_circuit_dashboard,
     format_circuit_info,
+    create_path_matrix_plotly,
+    create_layer_importance_plotly,
+    create_circuit_diagram_plotly,
+    create_component_importance_plotly,
+    create_circuit_summary_markdown,
 )
+import plotly.graph_objects as go
 
 
 def _make_circuit_result(num_layers=4, with_components=False, with_circuit=True):
@@ -149,3 +155,77 @@ def test_format_info_includes_logit_diffs():
     info = format_circuit_info(result)
     assert "logit diff" in info.lower()
     assert "5.000" in info or "+5.000" in info
+
+
+# ---- Plotly visualization tests ----
+
+def test_path_matrix_plotly_returns_figure():
+    result, arch_map = _make_circuit_result()
+    fig = create_path_matrix_plotly(result, arch_map)
+    assert isinstance(fig, go.Figure)
+
+
+def test_layer_importance_plotly_returns_figure():
+    result, arch_map = _make_circuit_result()
+    fig = create_layer_importance_plotly(result, arch_map)
+    assert isinstance(fig, go.Figure)
+
+
+def test_circuit_diagram_plotly_returns_figure():
+    result, arch_map = _make_circuit_result()
+    fig = create_circuit_diagram_plotly(result, arch_map)
+    assert isinstance(fig, go.Figure)
+
+
+def test_circuit_diagram_plotly_filters_top_n():
+    """With many nodes, diagram should filter to top-N."""
+    num_layers = 32
+    result, arch_map = _make_circuit_result(num_layers=num_layers, with_circuit=False)
+    # Manually add 32 nodes
+    nodes = []
+    for i in range(num_layers):
+        lt = arch_map.layer_type(i)
+        nodes.append(CircuitNode(layer_idx=i, layer_type=lt,
+                                 importance=float(torch.randn(1).item())))
+    edges = [CircuitEdge(source_layer=0, target_layer=5, importance=0.3,
+                         source_type="mamba", target_type="attention")]
+    result.circuit_nodes = nodes
+    result.circuit_edges = edges
+
+    fig = create_circuit_diagram_plotly(result, arch_map, max_nodes=10)
+    assert isinstance(fig, go.Figure)
+    # Should have filtered note in title
+    assert "top 10" in fig.layout.title.text.lower()
+
+
+def test_component_importance_plotly_returns_figure():
+    result, arch_map = _make_circuit_result(with_components=True)
+    fig = create_component_importance_plotly(result, arch_map)
+    assert isinstance(fig, go.Figure)
+    # Should have heatmap data
+    assert len(fig.data) > 0
+
+
+def test_component_importance_plotly_empty():
+    """No component data should return a valid figure with message."""
+    result, arch_map = _make_circuit_result(with_components=False)
+    fig = create_component_importance_plotly(result, arch_map)
+    assert isinstance(fig, go.Figure)
+
+
+def test_circuit_summary_markdown_returns_string():
+    result, arch_map = _make_circuit_result(with_components=True)
+    md = create_circuit_summary_markdown(result, arch_map)
+    assert isinstance(md, str)
+    assert "Circuit Discovery" in md
+    assert "Paris" in md
+
+
+def test_plotly_functions_handle_none():
+    """All Plotly functions should handle None input gracefully."""
+    arch_map = MagicMock()
+    assert isinstance(create_path_matrix_plotly(None, arch_map), go.Figure)
+    assert isinstance(create_layer_importance_plotly(None, arch_map), go.Figure)
+    assert isinstance(create_circuit_diagram_plotly(None, arch_map), go.Figure)
+    assert isinstance(create_component_importance_plotly(None, arch_map), go.Figure)
+    assert isinstance(create_circuit_summary_markdown(None, arch_map), str)

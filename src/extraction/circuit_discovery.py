@@ -115,51 +115,6 @@ class CircuitDiscoveryEngine(InterventionBase):
     automatic circuit extraction.
     """
 
-    def _compute_layer_output(self, prompt: str) -> dict:
-        """Compute the *isolated contribution* of each layer to the residual stream.
-
-        In a residual stream architecture, layer L's output is added to the stream:
-            residual_after_L = residual_before_L + layer_L_contribution
-
-        We capture the full residual after each layer in run_and_cache. The isolated
-        contribution is: layer_L_output = residual_after_L - residual_before_L.
-
-        For layer 0, residual_before is the embedding output. We capture it here.
-        """
-        cache = self.run_and_cache(prompt)
-        residual = cache["residual_stream"]
-
-        # Get the embedding output (input to layer 0)
-        inputs = self.tokenizer(
-            prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
-        ).to(self.device)
-
-        embedding_output = None
-
-        def embed_hook(module, input, output):
-            nonlocal embedding_output
-            embedding_output = output.detach().clone().cpu()
-
-        # Hook the embedding layer (model.model.embed_tokens)
-        h = self.model.model.embed_tokens.register_forward_hook(embed_hook)
-        try:
-            with torch.no_grad():
-                self.model(**inputs)
-        finally:
-            h.remove()
-
-        # Compute per-layer isolated contributions
-        layer_contributions = {}
-        num_layers = self.arch_map.num_layers
-        for layer_idx in range(num_layers):
-            if layer_idx == 0:
-                prev_residual = embedding_output
-            else:
-                prev_residual = residual[layer_idx - 1]
-            layer_contributions[layer_idx] = residual[layer_idx] - prev_residual
-
-        return layer_contributions
-
     def path_patch(
         self,
         clean_prompt: str,
@@ -258,6 +213,8 @@ class CircuitDiscoveryEngine(InterventionBase):
 
         clean_cache = self.run_and_cache(clean_prompt)
         corrupted_cache = self.run_and_cache(corrupted_prompt)
+        if not clean_cache["tokens"] or not corrupted_cache["tokens"]:
+            raise ValueError("One or both prompts produced no tokens.")
 
         (
             clean_logit_diff,
@@ -277,7 +234,7 @@ class CircuitDiscoveryEngine(InterventionBase):
         layer_importance = torch.zeros(num_layers)
         for layer_idx in range(num_layers):
             patched_logits = self._run_with_layer_patch(
-                corrupted_prompt, layer_idx, clean_cache
+                corrupted_prompt, layer_idx, clean_contributions, corrupted_contributions
             )
             patched_diff = self._get_logit_diff(patched_logits, correct_id, incorrect_id)
             if abs(denominator) > MIN_RECOVERY_DENOMINATOR:
@@ -326,9 +283,16 @@ class CircuitDiscoveryEngine(InterventionBase):
         self,
         prompt: str,
         target_layer: int,
-        clean_cache: dict,
+        clean_contributions: dict,
+        corrupted_contributions: dict,
     ) -> torch.Tensor:
-        """Run forward pass with full layer output replaced by clean activations."""
+        """Run forward pass replacing only the target layer's isolated contribution.
+
+        Instead of replacing the full cumulative residual stream (which would
+        restore all upstream layers' contributions too), this swaps only the
+        target layer's additive contribution:
+            output = corrupted_output - corrupted_contrib + clean_contrib
+        """
         inputs = self.tokenizer(
             prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
         ).to(self.device)
@@ -339,10 +303,16 @@ class CircuitDiscoveryEngine(InterventionBase):
             else:
                 hidden = output
 
-            clean_hidden = clean_cache["residual_stream"][_idx].to(hidden.device)
-            min_seq = min(hidden.shape[1], clean_hidden.shape[1])
+            device = hidden.device
+            clean_c = clean_contributions[_idx].to(device)
+            corrupt_c = corrupted_contributions[_idx].to(device)
+            min_seq = min(hidden.shape[1], clean_c.shape[1], corrupt_c.shape[1])
             modified = hidden.clone()
-            modified[:, :min_seq, :] = clean_hidden[:, :min_seq, :]
+            modified[:, :min_seq, :] = (
+                hidden[:, :min_seq, :]
+                - corrupt_c[:, :min_seq, :]
+                + clean_c[:, :min_seq, :]
+            )
 
             if isinstance(output, tuple):
                 return (modified,) + output[1:]
@@ -359,6 +329,36 @@ class CircuitDiscoveryEngine(InterventionBase):
 
         return outputs.logits.detach().cpu()
 
+    def _capture_clean_attn_output(self, clean_prompt: str, layer_idx: int) -> torch.Tensor | None:
+        """Run one clean forward pass and capture the self_attn output for a layer.
+
+        Returns the attention module output tensor, or None if the layer
+        has no self_attn attribute.
+        """
+        if not hasattr(self.model.model.layers[layer_idx], 'self_attn'):
+            return None
+
+        captured = None
+
+        def hook(module, input, output):
+            nonlocal captured
+            if isinstance(output, tuple):
+                captured = output[0].detach().clone()
+            else:
+                captured = output.detach().clone()
+
+        attn_module = self.model.model.layers[layer_idx].self_attn
+        inputs = self.tokenizer(
+            clean_prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
+        ).to(self.device)
+        h = attn_module.register_forward_hook(hook)
+        try:
+            with torch.no_grad():
+                self.model(**inputs)
+        finally:
+            h.remove()
+        return captured
+
     def patch_attention_head(
         self,
         clean_prompt: str,
@@ -367,9 +367,9 @@ class CircuitDiscoveryEngine(InterventionBase):
         head_idx: int,
         correct_id: int,
         incorrect_id: int,
-        clean_cache: dict,
         corrupted_logit_diff: float,
         denominator: float,
+        clean_attn_output: torch.Tensor | None = None,
     ) -> float:
         """Patch a single attention head's output within a Transformer layer.
 
@@ -377,6 +377,9 @@ class CircuitDiscoveryEngine(InterventionBase):
         specified head's contribution with the clean-run value.
 
         Only applicable to Transformer (attention) layers.
+
+        If clean_attn_output is provided, it is used directly (avoids a
+        redundant clean forward pass). Otherwise one is run internally.
         """
         if not self.arch_map.is_attention(layer_idx):
             return 0.0
@@ -387,42 +390,15 @@ class CircuitDiscoveryEngine(InterventionBase):
             corrupted_prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
         ).to(self.device)
 
-        # We need to capture the clean attention output for this layer.
-        # Run clean prompt and capture the self_attn output.
-        clean_attn_output = None
-        corrupted_attn_output = None
-
-        def capture_clean_hook(module, input, output):
-            nonlocal clean_attn_output
-            if isinstance(output, tuple):
-                clean_attn_output = output[0].detach().clone()
-            else:
-                clean_attn_output = output.detach().clone()
-
-        def capture_corrupt_hook(module, input, output):
-            nonlocal corrupted_attn_output
-            if isinstance(output, tuple):
-                corrupted_attn_output = output[0].detach().clone()
-            else:
-                corrupted_attn_output = output.detach().clone()
-
-        # Get clean attention output
-        clean_inputs = self.tokenizer(
-            clean_prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
-        ).to(self.device)
-
-        attn_module = self.model.model.layers[layer_idx].self_attn
-        h = attn_module.register_forward_hook(capture_clean_hook)
-        try:
-            with torch.no_grad():
-                self.model(**clean_inputs)
-        finally:
-            h.remove()
+        # Get clean attention output (use pre-computed if available)
+        if clean_attn_output is None:
+            clean_attn_output = self._capture_clean_attn_output(clean_prompt, layer_idx)
 
         if clean_attn_output is None:
             return 0.0
 
         # Now run corrupted with head-specific patching
+        attn_module = self.model.model.layers[layer_idx].self_attn
         num_heads = self.model.config.num_attention_heads
         head_dim = self.model.config.hidden_size // num_heads
 
@@ -472,7 +448,6 @@ class CircuitDiscoveryEngine(InterventionBase):
         corrupted_prompt: str,
         correct_id: int,
         incorrect_id: int,
-        clean_cache: dict,
         corrupted_logit_diff: float,
         denominator: float,
         important_layers: list[int] | None = None,
@@ -497,13 +472,14 @@ class CircuitDiscoveryEngine(InterventionBase):
         step = 0
 
         for layer_idx in target_layers:
+            cached_clean_attn = self._capture_clean_attn_output(clean_prompt, layer_idx)
             for head_idx in range(num_heads):
                 score = self.patch_attention_head(
                     clean_prompt, corrupted_prompt,
                     layer_idx, head_idx,
                     correct_id, incorrect_id,
-                    clean_cache,
                     corrupted_logit_diff, denominator,
+                    clean_attn_output=cached_clean_attn,
                 )
                 results.append(ComponentResult(
                     layer_idx=layer_idx,
@@ -538,34 +514,69 @@ class CircuitDiscoveryEngine(InterventionBase):
         Returns a CircuitResult with the full path matrix, layer importance,
         component results, and the extracted circuit graph.
         """
-        # Validate prompts produce tokens
-        clean_cache = self.run_and_cache(clean_prompt)
-        corrupted_cache = self.run_and_cache(corrupted_prompt)
-        if not clean_cache["tokens"] or not corrupted_cache["tokens"]:
-            raise ValueError("One or both prompts produced no tokens.")
+        num_layers = self.arch_map.num_layers
+        path_pairs = num_layers * (num_layers - 1) // 2
+        path_total = num_layers + path_pairs  # layer sweep + path sweep
 
-        # Phase 1+2: Sweep paths (includes layer sweep internally)
-        path_matrix, layer_importance, metadata = self.sweep_paths(
-            clean_prompt, corrupted_prompt,
-            correct_token, incorrect_token,
-            progress_callback=progress_callback,
-        )
+        # Build offset-aware progress wrappers so the bar never jumps backward
+        # when transitioning from path sweep to component sweep.
+        if granularity == SweepGranularity.DETAILED and progress_callback:
+            # Worst-case component steps (all attention layers are important)
+            num_heads = self.model.config.num_attention_heads
+            max_component_steps = len(self.arch_map.attention_indices) * num_heads
+            global_total = path_total + max_component_steps
 
-        # Phase 3: Component-level sweep (DETAILED mode only)
-        component_results = []
-        if granularity == SweepGranularity.DETAILED:
+            def path_progress(step, _total):
+                progress_callback(step, global_total)
+
+            path_matrix, layer_importance, metadata = self.sweep_paths(
+                clean_prompt, corrupted_prompt,
+                correct_token, incorrect_token,
+                progress_callback=path_progress,
+            )
+
+            # Compute actual component steps now that we know important_layers
             important_layers = [
-                i for i in range(self.arch_map.num_layers)
+                i for i in range(num_layers)
                 if abs(layer_importance[i].item()) >= threshold
             ]
+            important_attn = [
+                idx for idx in self.arch_map.attention_indices
+                if idx in important_layers
+            ]
+            actual_component_steps = len(important_attn) * num_heads
+            true_total = path_total + actual_component_steps
+
+            def component_progress(step, _total):
+                progress_callback(path_total + step, true_total)
+
             component_results = self.sweep_components(
                 clean_prompt, corrupted_prompt,
                 metadata["correct_id"], metadata["incorrect_id"],
-                self.run_and_cache(clean_prompt),
                 metadata["corrupted_logit_diff"], metadata["denominator"],
                 important_layers=important_layers,
+                progress_callback=component_progress,
+            )
+        else:
+            # FAST mode or no callback: pass through directly
+            path_matrix, layer_importance, metadata = self.sweep_paths(
+                clean_prompt, corrupted_prompt,
+                correct_token, incorrect_token,
                 progress_callback=progress_callback,
             )
+
+            component_results = []
+            if granularity == SweepGranularity.DETAILED:
+                important_layers = [
+                    i for i in range(num_layers)
+                    if abs(layer_importance[i].item()) >= threshold
+                ]
+                component_results = self.sweep_components(
+                    clean_prompt, corrupted_prompt,
+                    metadata["correct_id"], metadata["incorrect_id"],
+                    metadata["corrupted_logit_diff"], metadata["denominator"],
+                    important_layers=important_layers,
+                )
 
         # Phase 4: Extract circuit graph
         nodes, edges = self._extract_circuit(

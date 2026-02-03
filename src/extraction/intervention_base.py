@@ -64,6 +64,7 @@ class InterventionBase:
 
         Returns dict with:
             residual_stream: {layer_idx: Tensor[batch, seq, hidden_dim]}
+            embedding: Tensor[batch, seq, hidden_dim]  (embedding layer output)
             logits: Tensor[batch, seq, vocab_size]
             tokens: list[str]
         """
@@ -77,9 +78,17 @@ class InterventionBase:
         input_ids = inputs["input_ids"]
         tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
 
-        # Register residual stream hooks (read-only)
+        # Register hooks (read-only): embedding + residual stream at every layer
         storage = {}
         hooks = []
+        embedding_output = None
+
+        def embed_hook_fn(module, input, output):
+            nonlocal embedding_output
+            embedding_output = output.detach().clone().cpu()
+
+        hooks.append(self.model.model.embed_tokens.register_forward_hook(embed_hook_fn))
+
         for layer_idx in range(self.arch_map.num_layers):
             layer = self.model.model.layers[layer_idx]
 
@@ -102,6 +111,7 @@ class InterventionBase:
 
         result = {
             "residual_stream": storage,
+            "embedding": embedding_output,
             "logits": outputs.logits.detach().cpu(),
             "tokens": tokens,
         }
@@ -145,3 +155,26 @@ class InterventionBase:
             clean_probs[correct_id].item(),
             corrupted_probs[correct_id].item(),
         )
+
+    def _compute_layer_output(self, prompt: str) -> dict:
+        """Compute the *isolated contribution* of each layer to the residual stream.
+
+        In a residual stream architecture, layer L's output is added to the stream:
+            residual_after_L = residual_before_L + layer_L_contribution
+
+        We capture the full residual after each layer in run_and_cache. The isolated
+        contribution is: layer_L_output = residual_after_L - residual_before_L.
+
+        For layer 0, residual_before is the embedding output (cached by run_and_cache).
+        """
+        cache = self.run_and_cache(prompt)
+        residual = cache["residual_stream"]
+        embedding_output = cache["embedding"]
+
+        layer_contributions = {}
+        num_layers = self.arch_map.num_layers
+        for layer_idx in range(num_layers):
+            prev = embedding_output if layer_idx == 0 else residual[layer_idx - 1]
+            layer_contributions[layer_idx] = residual[layer_idx] - prev
+
+        return layer_contributions
