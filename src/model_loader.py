@@ -4,8 +4,9 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Force slow path so we can hook intermediates
-os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+# AMD ROCm-specific: override GFX version for GPU compatibility
+if torch.cuda.is_available() and hasattr(torch.version, "hip"):
+    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 
 DEFAULT_MODEL_ID = "ibm-granite/granite-4.0-h-350m"
 

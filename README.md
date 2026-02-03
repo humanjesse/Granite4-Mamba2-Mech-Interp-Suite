@@ -1,3 +1,15 @@
+---
+title: Granite 4.0 Mamba-2 Interpretability Suite
+emoji: 🔬
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+sdk_version: "6.5.1"
+app_file: app.py
+pinned: false
+suggested_hardware: cpu-basic
+---
+
 # Granite 4.0 Mamba-2 Interpretability Tool
 
 The first interpretability tool for IBM Granite 4.0's hybrid Mamba-2/Transformer architecture. Extracts "hidden attention" matrices from Mamba-2 layers — making the black-box SSM layers as interpretable as standard Transformer attention.

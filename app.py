@@ -2,10 +2,11 @@
 
 import os
 
-os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+import torch
+if torch.cuda.is_available() and hasattr(torch.version, "hip"):
+    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 
 import gradio as gr
-import torch
 import matplotlib
 matplotlib.use("Agg")
 
@@ -756,7 +757,13 @@ SSM layers interpretable alongside standard Transformer attention.
 if __name__ == "__main__":
     initialize()
     app = build_app()
-    auth_user = os.environ.get("GRADIO_AUTH_USERNAME")
-    auth_pass = os.environ.get("GRADIO_AUTH_PASSWORD")
-    auth = (auth_user, auth_pass) if auth_user and auth_pass else None
-    app.launch(share=False, auth=auth, server_name="127.0.0.1", server_port=7860)
+
+    if os.environ.get("SPACE_ID"):
+        # HuggingFace Spaces: bind to all interfaces, no auth
+        app.launch(server_name="0.0.0.0", server_port=7860)
+    else:
+        # Local development: localhost only, optional auth
+        auth_user = os.environ.get("GRADIO_AUTH_USERNAME")
+        auth_pass = os.environ.get("GRADIO_AUTH_PASSWORD")
+        auth = (auth_user, auth_pass) if auth_user and auth_pass else None
+        app.launch(share=False, auth=auth, server_name="127.0.0.1", server_port=7860)
