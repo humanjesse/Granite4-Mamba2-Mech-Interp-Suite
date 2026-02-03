@@ -18,14 +18,26 @@ from src.visualization.comparison import create_comparison_view
 from src.visualization.logit_lens import create_logit_lens_heatmap
 from src.visualization.neuron_activation import create_neuron_activation_heatmap, format_neuron_info
 from src.extraction.activation_diff import compute_activation_diff
-from src.visualization.activation_diff_viz import create_activation_diff_summary, format_diff_info
+from src.visualization.activation_diff_viz import (
+    create_activation_diff_summary, format_diff_info,
+    create_residual_similarity_plotly, create_attention_divergence_plotly,
+    create_neuron_changes_plotly, create_logit_lens_diff_plotly,
+)
 from src.extraction.multistep_generator import run_multistep_generation
-from src.visualization.multistep_viz import create_multistep_dashboard, format_multistep_info
+from src.visualization.multistep_viz import (
+    create_multistep_dashboard, format_multistep_info,
+    create_token_timeline_plotly, create_logit_lens_compact_plotly,
+    create_mamba_attention_plotly, create_transformer_attention_plotly,
+)
 from src.extraction.causal_intervention import CausalInterventionEngine, InterventionType
 from src.visualization.intervention_viz import (
     create_layer_sweep_dashboard,
     create_full_sweep_dashboard,
     format_intervention_info,
+    create_position_layer_heatmap_plotly,
+    create_layer_marginal_plotly,
+    create_position_marginal_plotly,
+    create_intervention_summary_markdown,
 )
 from src.extraction.circuit_discovery import CircuitDiscoveryEngine, SweepGranularity
 from src.visualization.circuit_viz import (
@@ -587,6 +599,39 @@ SSM layers interpretable alongside standard Transformer attention.
                         with gr.Tab("Summary"):
                             circuit_summary_md = gr.Markdown("Run circuit discovery to see results.")
 
+                with gr.Column(visible=False) as diff_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Residual Similarity"):
+                            diff_residual_plot = gr.Plot(label="Residual Stream Cosine Similarity")
+                        with gr.Tab("Attention Divergence"):
+                            diff_attention_plot = gr.Plot(label="Attention Pattern Divergence")
+                        with gr.Tab("Top Changed Neurons"):
+                            diff_neuron_plot = gr.Plot(label="Top Changed Neurons")
+                        with gr.Tab("Logit Lens Diff"):
+                            diff_logit_plot = gr.Plot(label="Logit Lens Prediction Diff")
+
+                with gr.Column(visible=False) as intervention_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Recovery Heatmap"):
+                            intervention_heatmap_plot = gr.Plot(label="Position × Layer Recovery")
+                        with gr.Tab("Layer Recovery"):
+                            intervention_layer_plot = gr.Plot(label="Per-Layer Mean Recovery")
+                        with gr.Tab("Position Recovery"):
+                            intervention_position_plot = gr.Plot(label="Per-Position Mean Recovery")
+                        with gr.Tab("Summary"):
+                            intervention_summary_md = gr.Markdown("Run a full sweep to see results.")
+
+                with gr.Column(visible=False) as multistep_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Token Timeline"):
+                            multistep_timeline_plot = gr.Plot(label="Token Timeline")
+                        with gr.Tab("Logit Lens"):
+                            multistep_logit_plot = gr.Plot(label="Logit Lens")
+                        with gr.Tab("Mamba Attention"):
+                            multistep_mamba_plot = gr.Plot(label="Mamba-2 Attention")
+                        with gr.Tab("Transformer Attention"):
+                            multistep_transformer_plot = gr.Plot(label="Transformer Attention")
+
                 output_info = gr.Textbox(label="Info", interactive=False, lines=4)
 
         # Update layer type label when slider changes
@@ -601,7 +646,10 @@ SSM layers interpretable alongside standard Transformer attention.
             is_multistep = (mode == "Multi-Step Generation")
             is_intervention = (mode == "Causal Intervention")
             is_circuit = (mode == "Circuit Discovery")
+            is_diff = (mode == "Activation Diff")
             needs_tokens = is_intervention or is_circuit
+            # single_plot_wrapper: visible when NOT circuit/diff/intervention/multistep
+            show_single = not (is_circuit or is_diff or is_intervention or is_multistep)
             return (
                 gr.update(visible=is_multistep),     # max_tokens_slider
                 gr.update(visible=is_multistep),     # step_nav_slider
@@ -612,8 +660,11 @@ SSM layers interpretable alongside standard Transformer attention.
                 gr.update(visible=is_intervention),  # sweep_mode_radio
                 gr.update(visible=is_circuit),       # circuit_threshold_slider
                 gr.update(visible=is_circuit),       # circuit_granularity_radio
-                gr.update(visible=not is_circuit),   # single_plot_wrapper
+                gr.update(visible=show_single),      # single_plot_wrapper
                 gr.update(visible=is_circuit),       # circuit_output_wrapper
+                gr.update(visible=is_diff),          # diff_output_wrapper
+                gr.update(visible=is_intervention),  # intervention_output_wrapper
+                gr.update(visible=is_multistep),     # multistep_output_wrapper
             )
 
         view_mode.change(
@@ -625,14 +676,14 @@ SSM layers interpretable alongside standard Transformer attention.
                 intervention_type_radio, sweep_mode_radio,
                 circuit_threshold_slider, circuit_granularity_radio,
                 single_plot_wrapper, circuit_output_wrapper,
+                diff_output_wrapper, intervention_output_wrapper,
+                multistep_output_wrapper,
             ],
         )
 
-        # Helper: default gr.update() values for circuit-specific output slots
+        # Helper: default gr.update() values for tab-specific output slots
         def _default_circuit_outputs():
             return (
-                gr.update(visible=True),   # single_plot_wrapper
-                gr.update(visible=False),  # circuit_output_wrapper
                 gr.update(),               # circuit_path_plot
                 gr.update(),               # circuit_layer_plot
                 gr.update(),               # circuit_diagram_plot
@@ -640,12 +691,60 @@ SSM layers interpretable alongside standard Transformer attention.
                 gr.update(),               # circuit_summary_md
             )
 
+        def _default_diff_outputs():
+            return (
+                gr.update(),               # diff_residual_plot
+                gr.update(),               # diff_attention_plot
+                gr.update(),               # diff_neuron_plot
+                gr.update(),               # diff_logit_plot
+            )
+
+        def _default_intervention_outputs():
+            return (
+                gr.update(),               # intervention_heatmap_plot
+                gr.update(),               # intervention_layer_plot
+                gr.update(),               # intervention_position_plot
+                gr.update(),               # intervention_summary_md
+            )
+
+        def _default_multistep_outputs():
+            return (
+                gr.update(),               # multistep_timeline_plot
+                gr.update(),               # multistep_logit_plot
+                gr.update(),               # multistep_mamba_plot
+                gr.update(),               # multistep_transformer_plot
+            )
+
         # Main analysis function
         def analyze(prompt, prompt_b, view_mode, layer_idx, head_agg, max_tokens, step_idx,
                     correct_token, incorrect_token, intervention_type, sweep_mode,
                     circuit_threshold, circuit_granularity, progress=gr.Progress(track_tqdm=False)):
+
+            # Common prefix for non-tabbed views: output_plot, output_info, step_nav_slider,
+            # then 5 wrapper visibilities, then all tab slot updates
+            def _make_return(plot, info, slider_upd, vis_mode, **tab_overrides):
+                """Build the full return tuple.
+
+                vis_mode: one of "single", "circuit", "diff", "intervention", "multistep"
+                tab_overrides: dict of group -> tuple, e.g. circuit=(p,l,d,c,s)
+                """
+                wrappers = (
+                    gr.update(visible=(vis_mode == "single")),
+                    gr.update(visible=(vis_mode == "circuit")),
+                    gr.update(visible=(vis_mode == "diff")),
+                    gr.update(visible=(vis_mode == "intervention")),
+                    gr.update(visible=(vis_mode == "multistep")),
+                )
+
+                circuit = tab_overrides.get("circuit", _default_circuit_outputs())
+                diff = tab_overrides.get("diff", _default_diff_outputs())
+                intervention = tab_overrides.get("intervention", _default_intervention_outputs())
+                multistep = tab_overrides.get("multistep", _default_multistep_outputs())
+
+                return (plot, info, slider_upd) + wrappers + circuit + diff + intervention + multistep
+
             if not prompt or not prompt.strip():
-                return (None, "Please enter a prompt.", gr.update()) + _default_circuit_outputs()
+                return _make_return(None, "Please enter a prompt.", gr.update(), "single")
 
             try:
                 if view_mode == "Circuit Discovery":
@@ -664,23 +763,85 @@ SSM layers interpretable alongside standard Transformer attention.
                     component_fig = create_component_importance_plotly(circuit_result, ARCH_MAP)
                     summary_md = create_circuit_summary_markdown(circuit_result, ARCH_MAP)
 
-                    return (
-                        gr.update(),              # output_plot (unused)
-                        info,                     # output_info
-                        gr.update(),              # step_nav_slider
-                        gr.update(visible=False), # single_plot_wrapper
-                        gr.update(visible=True),  # circuit_output_wrapper
-                        path_fig,                 # circuit_path_plot
-                        layer_fig,                # circuit_layer_plot
-                        diagram_fig,              # circuit_diagram_plot
-                        component_fig,            # circuit_component_plot
-                        summary_md,               # circuit_summary_md
+                    return _make_return(
+                        gr.update(), info, gr.update(), "circuit",
+                        circuit=(path_fig, layer_fig, diagram_fig, component_fig, summary_md),
                     )
 
+                if view_mode == "Activation Diff":
+                    if not prompt_b or not prompt_b.strip():
+                        return _make_return(None, "Please enter a comparison prompt (Prompt B).", gr.update(), "diff")
+                    result_a = run_extraction(prompt)
+                    result_b = run_extraction(prompt_b)
+                    if result_a is None or result_b is None:
+                        return _make_return(None, "Extraction failed for one or both prompts.", gr.update(), "diff")
+                    diff_result = compute_activation_diff(result_a, result_b, head_agg=head_agg)
+                    info = format_diff_info(diff_result)
+                    return _make_return(
+                        gr.update(), info, gr.update(), "diff",
+                        diff=(
+                            create_residual_similarity_plotly(diff_result, ARCH_MAP),
+                            create_attention_divergence_plotly(diff_result),
+                            create_neuron_changes_plotly(diff_result),
+                            create_logit_lens_diff_plotly(diff_result),
+                        ),
+                    )
+
+                if view_mode == "Causal Intervention":
+                    def iv_progress(step, total):
+                        progress(step / total, desc=f"Intervention sweep: {step}/{total}")
+
+                    fig, info = intervention_view(
+                        prompt, prompt_b, correct_token, incorrect_token,
+                        intervention_type, sweep_mode,
+                        progress_callback=iv_progress,
+                    )
+
+                    # Check if this is a full sweep (2D matrix) — use tabs
+                    cache_key = (
+                        prompt.strip(), (prompt_b or "").strip(),
+                        (correct_token or "").strip(), (incorrect_token or "").strip(),
+                        intervention_type, sweep_mode,
+                    )
+                    sweep_result = INTERVENTION_CACHE.get(cache_key)
+                    is_full = (sweep_result is not None
+                               and sweep_result.recovery_matrix.dim() == 2)
+
+                    if is_full:
+                        return _make_return(
+                            gr.update(), info, gr.update(), "intervention",
+                            intervention=(
+                                create_position_layer_heatmap_plotly(sweep_result, ARCH_MAP),
+                                create_layer_marginal_plotly(sweep_result, ARCH_MAP),
+                                create_position_marginal_plotly(sweep_result),
+                                create_intervention_summary_markdown(sweep_result),
+                            ),
+                        )
+                    else:
+                        # Layer sweep — single plot, no tabs
+                        return _make_return(fig, info, gr.update(), "single")
+
                 if view_mode == "Multi-Step Generation":
-                    fig, info, slider_update = multistep_view(prompt, max_tokens, step_idx, head_agg)
-                    return (fig, info, slider_update) + _default_circuit_outputs()
-                elif view_mode == "Single Layer":
+                    fig_compat, info, slider_update = multistep_view(prompt, max_tokens, step_idx, head_agg)
+                    step_data = None
+                    cache_key = (prompt.strip(), int(max_tokens))
+                    if cache_key in MULTISTEP_CACHE:
+                        result = MULTISTEP_CACHE[cache_key]
+                        sidx = max(0, min(int(step_idx), len(result["steps"]) - 1))
+                        step_data = result["steps"][sidx]
+
+                    return _make_return(
+                        gr.update(), info, slider_update, "multistep",
+                        multistep=(
+                            create_token_timeline_plotly(step_data),
+                            create_logit_lens_compact_plotly(step_data),
+                            create_mamba_attention_plotly(step_data, ARCH_MAP, head_agg),
+                            create_transformer_attention_plotly(step_data, ARCH_MAP, head_agg),
+                        ),
+                    )
+
+                # All other views — single plot
+                if view_mode == "Single Layer":
                     fig, info = single_layer_view(prompt, layer_idx, head_agg)
                 elif view_mode == "Mamba vs Transformer":
                     fig, info = comparison_view(prompt, head_agg)
@@ -690,33 +851,38 @@ SSM layers interpretable alongside standard Transformer attention.
                     fig, info = logit_lens_view(prompt)
                 elif view_mode == "Neuron Activation":
                     fig, info = neuron_activation_view(prompt, layer_idx)
-                elif view_mode == "Activation Diff":
-                    fig, info = activation_diff_view(prompt, prompt_b, head_agg)
-                elif view_mode == "Causal Intervention":
-                    def iv_progress(step, total):
-                        progress(step / total, desc=f"Intervention sweep: {step}/{total}")
-
-                    fig, info = intervention_view(
-                        prompt, prompt_b, correct_token, incorrect_token,
-                        intervention_type, sweep_mode,
-                        progress_callback=iv_progress,
-                    )
                 else:
-                    return (None, "Unknown view mode.", gr.update()) + _default_circuit_outputs()
-                return (fig, info, gr.update()) + _default_circuit_outputs()
+                    return _make_return(None, "Unknown view mode.", gr.update(), "single")
+
+                return _make_return(fig, info, gr.update(), "single")
             except Exception as e:
-                return (None, f"Error: {str(e)}", gr.update()) + _default_circuit_outputs()
+                return _make_return(None, f"Error: {str(e)}", gr.update(), "single")
 
         all_inputs = [prompt_input, prompt_b_input, view_mode, layer_slider,
                       head_agg, max_tokens_slider, step_nav_slider,
                       correct_token_input, incorrect_token_input,
                       intervention_type_radio, sweep_mode_radio,
                       circuit_threshold_slider, circuit_granularity_radio]
-        all_outputs = [output_plot, output_info, step_nav_slider,
-                       single_plot_wrapper, circuit_output_wrapper,
-                       circuit_path_plot, circuit_layer_plot,
-                       circuit_diagram_plot, circuit_component_plot,
-                       circuit_summary_md]
+        all_outputs = [
+            output_plot, output_info, step_nav_slider,
+            # 5 wrapper visibilities
+            single_plot_wrapper, circuit_output_wrapper,
+            diff_output_wrapper, intervention_output_wrapper,
+            multistep_output_wrapper,
+            # Circuit tabs (5)
+            circuit_path_plot, circuit_layer_plot,
+            circuit_diagram_plot, circuit_component_plot,
+            circuit_summary_md,
+            # Diff tabs (4)
+            diff_residual_plot, diff_attention_plot,
+            diff_neuron_plot, diff_logit_plot,
+            # Intervention tabs (4)
+            intervention_heatmap_plot, intervention_layer_plot,
+            intervention_position_plot, intervention_summary_md,
+            # Multistep tabs (4)
+            multistep_timeline_plot, multistep_logit_plot,
+            multistep_mamba_plot, multistep_transformer_plot,
+        ]
 
         analyze_btn.click(fn=analyze, inputs=all_inputs, outputs=all_outputs)
 
@@ -725,7 +891,11 @@ SSM layers interpretable alongside standard Transformer attention.
 
         # Step slider navigates between cached steps without re-generating
         def on_step_change(prompt, max_tokens, step_idx, head_agg, current_mode):
-            no_change = (gr.update(), gr.update()) + tuple(gr.update() for _ in range(5))
+            # Must return same shape as all_outputs minus the first 3 (plot, info, slider)
+            # plus the first 2 (plot, info). Total = 2 + (len(all_outputs) - 3) padding
+            n_tab_slots = 5 + 4 + 4 + 4  # circuit + diff + intervention + multistep
+            n_wrappers = 5
+            no_change = (gr.update(), gr.update()) + tuple(gr.update() for _ in range(n_wrappers + n_tab_slots))
             if current_mode != "Multi-Step Generation":
                 return no_change
             cache_key = (prompt.strip(), int(max_tokens))
@@ -734,21 +904,44 @@ SSM layers interpretable alongside standard Transformer attention.
             result = MULTISTEP_CACHE[cache_key]
             num_steps = len(result["steps"])
             step_idx = max(0, min(int(step_idx), num_steps - 1))
-            fig = create_multistep_dashboard(
-                step_data=result["steps"][step_idx],
-                arch_map=ARCH_MAP,
-                head_agg=head_agg,
-            )
+            step_data = result["steps"][step_idx]
             info = format_multistep_info(result, step_idx)
-            return (fig, info) + tuple(gr.update() for _ in range(5))
+
+            # Build multistep Plotly figures
+            timeline_fig = create_token_timeline_plotly(step_data)
+            logit_fig = create_logit_lens_compact_plotly(step_data)
+            mamba_fig = create_mamba_attention_plotly(step_data, ARCH_MAP, head_agg)
+            transformer_fig = create_transformer_attention_plotly(step_data, ARCH_MAP, head_agg)
+
+            # Return: output_plot (unused), output_info, 5 wrappers (no change),
+            # circuit(5) no change, diff(4) no change, intervention(4) no change,
+            # multistep(4) updated
+            padding = tuple(gr.update() for _ in range(n_wrappers + 5 + 4 + 4))
+            return (
+                gr.update(),  # output_plot
+                info,         # output_info
+            ) + padding + (timeline_fig, logit_fig, mamba_fig, transformer_fig)
+
+        step_nav_outputs = [
+            output_plot, output_info,
+            single_plot_wrapper, circuit_output_wrapper,
+            diff_output_wrapper, intervention_output_wrapper,
+            multistep_output_wrapper,
+            circuit_path_plot, circuit_layer_plot,
+            circuit_diagram_plot, circuit_component_plot,
+            circuit_summary_md,
+            diff_residual_plot, diff_attention_plot,
+            diff_neuron_plot, diff_logit_plot,
+            intervention_heatmap_plot, intervention_layer_plot,
+            intervention_position_plot, intervention_summary_md,
+            multistep_timeline_plot, multistep_logit_plot,
+            multistep_mamba_plot, multistep_transformer_plot,
+        ]
 
         step_nav_slider.release(
             fn=on_step_change,
             inputs=[prompt_input, max_tokens_slider, step_nav_slider, head_agg, view_mode],
-            outputs=[output_plot, output_info,
-                     circuit_path_plot, circuit_layer_plot,
-                     circuit_diagram_plot, circuit_component_plot,
-                     circuit_summary_md],
+            outputs=step_nav_outputs,
         )
 
     return app

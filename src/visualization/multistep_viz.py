@@ -6,6 +6,12 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 import torch
+import plotly.graph_objects as go
+
+
+# ── Color scheme ─────────────────────────────────────────────────────────────
+MAMBA_COLOR = "#ab47bc"
+TRANSFORMER_COLOR = "#26a69a"
 
 
 def create_multistep_dashboard(step_data, arch_map, head_agg="mean"):
@@ -213,6 +219,215 @@ def _plot_attention_panel(ax, result, arch_map, layer_type, head_agg):
     ax.set_ylabel("Query", fontsize=8)
     ax.set_title(f"{label} Attention — Layer {chosen} ({head_agg})", fontsize=11)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+
+def _empty_plotly(message: str) -> go.Figure:
+    """Return a Plotly figure with centered instructional text."""
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message, xref="paper", yref="paper", x=0.5, y=0.5,
+        showarrow=False, font=dict(size=14, color="gray"),
+    )
+    fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
+
+
+def create_token_timeline_plotly(step_data):
+    """Horizontal token boxes with the generated token highlighted."""
+    if step_data is None:
+        return _empty_plotly("No step data available.")
+
+    result = step_data["extraction_result"]
+    tokens = result["tokens"]
+    step_idx = step_data["step_idx"]
+    generated_token = step_data["generated_token"]
+    top_preds = step_data["top_predictions"]
+
+    n_tokens = len(tokens)
+    max_display = 20
+    offset = max(0, n_tokens - max_display)
+    display_tokens = tokens[offset:]
+    n_display = len(display_tokens)
+
+    fig = go.Figure()
+
+    # Draw token boxes as bar segments
+    for i, tok in enumerate(display_tokens):
+        tok_label = _truncate_token(tok, 10)
+        is_last = (i == n_display - 1)
+        color = "#FFB74D" if is_last else "#E0E0E0"
+        border_color = "#333" if is_last else "#999"
+
+        fig.add_shape(
+            type="rect", x0=i, x1=i + 1, y0=-0.3, y1=0.3,
+            fillcolor=color, line=dict(color=border_color, width=1),
+        )
+        fig.add_annotation(
+            x=i + 0.5, y=0, text=tok_label, showarrow=False,
+            font=dict(size=max(8, 11 - n_display // 8), family="monospace",
+                      color="black"),
+        )
+
+    # Generated token (green box)
+    gen_label = _truncate_token(generated_token, 15)
+    fig.add_shape(
+        type="rect", x0=n_display, x1=n_display + 1, y0=-0.3, y1=0.3,
+        fillcolor="#66BB6A", line=dict(color="#333", width=2),
+    )
+    fig.add_annotation(
+        x=n_display + 0.5, y=0, text=f"<b>{gen_label}</b>", showarrow=False,
+        font=dict(size=11, family="monospace", color="white"),
+    )
+
+    # Arrow annotation
+    fig.add_annotation(
+        x=n_display, y=0, ax=n_display - 0.3, ay=0,
+        xref="x", yref="y", axref="x", ayref="y",
+        showarrow=True, arrowhead=2, arrowsize=1.5, arrowcolor="#333",
+    )
+
+    # Offset indicator
+    if offset > 0:
+        fig.add_annotation(
+            x=-0.3, y=0, text=f"...+{offset}", showarrow=False,
+            font=dict(size=9, color="#888"),
+        )
+
+    # Top predictions as subtitle
+    pred_text = "Top: " + " | ".join(
+        f'"{t}" {p:.1%}' for t, p in top_preds[:5]
+    )
+    fig.add_annotation(
+        x=(n_display + 1) / 2, y=-0.6, text=pred_text, showarrow=False,
+        font=dict(size=10, family="monospace", color="#666"),
+    )
+
+    fig.update_layout(
+        title=f"Token Timeline — Step {step_idx + 1} → \"{gen_label}\"",
+        xaxis=dict(visible=False, range=[-1 if offset > 0 else -0.3, n_display + 1.5]),
+        yaxis=dict(visible=False, range=[-1, 0.6]),
+        height=250,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
+
+
+def create_logit_lens_compact_plotly(step_data, n_layers=8):
+    """Heatmap of last 8 layers showing top-k predictions and probabilities."""
+    if step_data is None:
+        return _empty_plotly("No step data available.")
+
+    result = step_data["extraction_result"]
+    logit_lens_data = result.get("logit_lens")
+    if not logit_lens_data or not logit_lens_data.get("layers"):
+        return _empty_plotly("No logit lens data available for this step.")
+
+    all_layers = logit_lens_data["layers"]
+    layers = all_layers[-n_layers:] if len(all_layers) > n_layers else all_layers
+    n_show = len(layers)
+    k = min(5, len(layers[0]["tokens"]) if layers else 5)
+
+    # Build data
+    prob_matrix = np.zeros((n_show, k))
+    annotations = []
+    for i, layer_data in enumerate(layers):
+        row = []
+        for j in range(k):
+            if j < len(layer_data["probs"]):
+                prob_matrix[i, j] = layer_data["probs"][j]
+                tok = layer_data["tokens"][j] if j < len(layer_data["tokens"]) else "?"
+                tok = tok[:8] + "…" if len(tok) > 8 else tok
+                row.append(f"{tok}<br>{layer_data['probs'][j]:.0%}")
+            else:
+                row.append("")
+        annotations.append(row)
+
+    # Hover text
+    hover = []
+    for i, layer_data in enumerate(layers):
+        row = []
+        for j in range(k):
+            if j < len(layer_data["probs"]):
+                tok = layer_data["tokens"][j] if j < len(layer_data["tokens"]) else "?"
+                row.append(f"Layer {layer_data['layer']}, Top-{j+1}: {tok} (p={layer_data['probs'][j]:.3f})")
+            else:
+                row.append("")
+        hover.append(row)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=prob_matrix,
+        x=[f"Top {j+1}" for j in range(k)],
+        y=[f"L{d['layer']}" for d in layers],
+        colorscale="YlOrRd", zmin=0, zmax=1,
+        hovertext=hover, hoverinfo="text",
+        colorbar=dict(title="Probability"),
+        text=annotations, texttemplate="%{text}",
+    ))
+
+    fig.update_layout(
+        title=f"Logit Lens — Last {n_show} Layers",
+        height=400,
+    )
+    return fig
+
+
+def _get_attention_plotly(step_data, arch_map, layer_type, head_agg):
+    """Build a Plotly heatmap for a representative layer of the given type."""
+    if step_data is None:
+        return _empty_plotly("No step data available.")
+
+    result = step_data["extraction_result"]
+    if layer_type == "mamba":
+        attn_dict = result.get("mamba_attention", {})
+        indices = arch_map.mamba_indices
+        colorscale = "Magma"
+        label = "Mamba-2"
+    else:
+        attn_dict = result.get("transformer_attention", {})
+        indices = arch_map.attention_indices
+        colorscale = "Viridis"
+        label = "Transformer"
+
+    available = [idx for idx in indices if idx in attn_dict]
+    if not available:
+        return _empty_plotly(f"No {label} attention data available.")
+
+    # Pick representative layer
+    chosen = available[len(available) // 2] if layer_type == "mamba" else available[-1]
+
+    attn = attn_dict[chosen][0]  # [heads, seq, seq]
+    if head_agg == "mean":
+        attn = attn.mean(dim=0).numpy()
+    else:
+        attn = attn.max(dim=0).values.numpy()
+
+    tokens = result["tokens"]
+    display_tokens = [_truncate_token(t, 10) for t in tokens]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=attn, x=display_tokens, y=display_tokens,
+        colorscale=colorscale,
+        hovertemplate="Query: %{y}<br>Key: %{x}<br>Weight: %{z:.4f}<extra></extra>",
+        colorbar=dict(title="Weight"),
+    ))
+
+    fig.update_layout(
+        title=f"{label} Attention — Layer {chosen} ({head_agg})",
+        xaxis_title="Key",
+        yaxis_title="Query",
+        height=500,
+    )
+    return fig
+
+
+def create_mamba_attention_plotly(step_data, arch_map, head_agg="mean"):
+    """Attention heatmap for a representative Mamba layer."""
+    return _get_attention_plotly(step_data, arch_map, "mamba", head_agg)
+
+
+def create_transformer_attention_plotly(step_data, arch_map, head_agg="mean"):
+    """Attention heatmap for a representative Transformer layer."""
+    return _get_attention_plotly(step_data, arch_map, "attention", head_agg)
 
 
 def format_multistep_info(multistep_result, current_step):

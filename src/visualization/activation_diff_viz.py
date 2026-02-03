@@ -2,6 +2,14 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
+
+
+# ── Color scheme (consistent with other viz modules) ─────────────────────────
+MAMBA_COLOR = "#ab47bc"
+TRANSFORMER_COLOR = "#26a69a"
+MAMBA_BG = "rgba(45,0,64,0.15)"
+TRANSFORMER_BG = "rgba(0,45,32,0.15)"
 
 
 def create_activation_diff_summary(diff_result: dict, arch_map) -> plt.Figure:
@@ -153,6 +161,216 @@ def _plot_logit_lens_diff(ax, logit_diff: dict):
         ax.text(0.75, i, text_b, ha="center", va="center", fontsize=7, fontfamily="monospace")
 
     ax.grid(False)
+
+
+def _empty_plotly(message: str) -> go.Figure:
+    """Return a Plotly figure with centered instructional text."""
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message, xref="paper", yref="paper", x=0.5, y=0.5,
+        showarrow=False, font=dict(size=14, color="gray"),
+    )
+    fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
+
+
+def create_residual_similarity_plotly(diff_result, arch_map):
+    """Line chart of residual stream cosine similarity per layer with layer-type shading."""
+    if diff_result is None:
+        return _empty_plotly("No activation diff data available.")
+
+    residual_sim = diff_result.get("residual_similarity", {})
+    layers = residual_sim.get("layers", [])
+    cosine = residual_sim.get("cosine_sim_mean", [])
+
+    if not layers:
+        return _empty_plotly("No residual stream data available.")
+
+    fig = go.Figure()
+
+    # Background shading by layer type
+    for i, layer_idx in enumerate(layers):
+        lt = arch_map.layer_type(layer_idx)
+        color = MAMBA_BG if lt == "mamba" else TRANSFORMER_BG
+        fig.add_vrect(x0=i - 0.5, x1=i + 0.5, fillcolor=color, line_width=0)
+
+    fig.add_trace(go.Scatter(
+        x=list(range(len(layers))), y=cosine,
+        mode="lines+markers",
+        line=dict(color="#4fc3f7", width=2),
+        marker=dict(size=4),
+        hovertext=[f"Layer {layers[i]}: {cosine[i]:.4f}" for i in range(len(layers))],
+        hoverinfo="text",
+    ))
+
+    fig.update_layout(
+        title="Residual Stream Cosine Similarity",
+        xaxis_title="Layer",
+        yaxis_title="Cosine Similarity",
+        yaxis=dict(range=[0, 1.05]),
+        xaxis=dict(
+            tickvals=list(range(0, len(layers), max(1, len(layers) // 15))),
+            ticktext=[str(layers[i]) for i in range(0, len(layers), max(1, len(layers) // 15))],
+        ),
+        height=500,
+    )
+    return fig
+
+
+def create_attention_divergence_plotly(diff_result):
+    """Bar chart of attention JSD per layer, color-coded by Mamba/Transformer."""
+    if diff_result is None:
+        return _empty_plotly("No activation diff data available.")
+
+    combined = diff_result.get("attention_divergence", {}).get("combined", [])
+    if not combined:
+        return _empty_plotly("No attention divergence data available.")
+
+    fig = go.Figure()
+
+    # Split into Mamba and Transformer traces for legend
+    mamba_x, mamba_y, mamba_hover = [], [], []
+    trans_x, trans_y, trans_hover = [], [], []
+    for i, (layer_idx, jsd, ltype) in enumerate(combined):
+        hover = f"Layer {layer_idx} ({ltype}): JSD={jsd:.4f}"
+        if ltype == "mamba":
+            mamba_x.append(i)
+            mamba_y.append(jsd)
+            mamba_hover.append(hover)
+        else:
+            trans_x.append(i)
+            trans_y.append(jsd)
+            trans_hover.append(hover)
+
+    if mamba_x:
+        fig.add_trace(go.Bar(
+            x=mamba_x, y=mamba_y, name="Mamba",
+            marker_color=MAMBA_COLOR,
+            hovertext=mamba_hover, hoverinfo="text",
+        ))
+    if trans_x:
+        fig.add_trace(go.Bar(
+            x=trans_x, y=trans_y, name="Transformer",
+            marker_color=TRANSFORMER_COLOR,
+            hovertext=trans_hover, hoverinfo="text",
+        ))
+
+    fig.update_layout(
+        title="Attention Pattern Divergence (JSD)",
+        xaxis_title="Layer",
+        yaxis_title="Jensen-Shannon Divergence",
+        xaxis=dict(
+            tickvals=list(range(0, len(combined), max(1, len(combined) // 15))),
+            ticktext=[str(combined[i][0]) for i in range(0, len(combined), max(1, len(combined) // 15))],
+        ),
+        barmode="overlay",
+        height=500,
+    )
+    return fig
+
+
+def create_neuron_changes_plotly(diff_result):
+    """Horizontal bar chart of top 15 changed neurons."""
+    if diff_result is None:
+        return _empty_plotly("No activation diff data available.")
+
+    top_neurons = diff_result.get("top_changed_neurons", [])
+    if not top_neurons:
+        return _empty_plotly("No neuron change data available.")
+
+    display = list(reversed(top_neurons[:15]))  # largest at top
+
+    labels = [f"L{n['layer']}.N{n['neuron_idx']}" for n in display]
+    deltas = [n["delta"] for n in display]
+    colors = ["#ef5350" if d > 0 else "#42a5f5" for d in deltas]
+    hover = [f"Layer {n['layer']}, Neuron {n['neuron_idx']}: delta={n['delta']:+.4f}" for n in display]
+
+    fig = go.Figure(go.Bar(
+        x=deltas, y=labels,
+        orientation="h",
+        marker_color=colors,
+        hovertext=hover, hoverinfo="text",
+    ))
+
+    fig.add_vline(x=0, line=dict(color="gray", width=1))
+
+    fig.update_layout(
+        title="Top Changed Neurons (B − A)",
+        xaxis_title="Activation Delta",
+        yaxis=dict(type="category"),
+        height=500,
+    )
+    return fig
+
+
+def create_logit_lens_diff_plotly(diff_result):
+    """Table/heatmap showing per-layer prediction diffs."""
+    if diff_result is None:
+        return _empty_plotly("No activation diff data available.")
+
+    layers = diff_result.get("logit_lens_diff", {}).get("layers", [])
+    if not layers:
+        return _empty_plotly("No logit lens data available.")
+
+    # Sample evenly if too many
+    if len(layers) > 30:
+        step = len(layers) // 30
+        layers = layers[::step]
+
+    layer_labels = [f"L{d['layer']}" for d in layers]
+    same_vals = [1 if d["same_prediction"] else 0 for d in layers]
+    text_a = [f"{d['top1_a']} ({d['prob_a']:.2f})" for d in layers]
+    text_b = [f"{d['top1_b']} ({d['prob_b']:.2f})" for d in layers]
+    hover = [
+        f"Layer {d['layer']}<br>A: {d['top1_a']} (p={d['prob_a']:.3f})<br>"
+        f"B: {d['top1_b']} (p={d['prob_b']:.3f})<br>"
+        f"{'Same' if d['same_prediction'] else 'Different'} prediction"
+        for d in layers
+    ]
+
+    # Use a heatmap with 2 columns: Prompt A, Prompt B
+    # Color by whether predictions match
+    color_vals = []
+    for d in layers:
+        if d["same_prediction"]:
+            color_vals.append([0.8, 0.8])  # green-ish
+        else:
+            color_vals.append([0.2, 0.2])  # red-ish
+
+    fig = go.Figure()
+
+    # Build as a table for clarity
+    fig.add_trace(go.Table(
+        header=dict(
+            values=["Layer", "Prompt A Top-1", "Prompt B Top-1", "Match?"],
+            fill_color="#333",
+            font=dict(color="white", size=12),
+            align="center",
+        ),
+        cells=dict(
+            values=[
+                layer_labels,
+                text_a,
+                text_b,
+                ["✓" if d["same_prediction"] else "✗" for d in layers],
+            ],
+            fill_color=[
+                ["#1a1a2e"] * len(layers),
+                ["#1a1a2e"] * len(layers),
+                ["#1a1a2e"] * len(layers),
+                ["#1b5e20" if d["same_prediction"] else "#b71c1c" for d in layers],
+            ],
+            font=dict(color="white", size=11, family="monospace"),
+            align="center",
+            height=28,
+        ),
+    ))
+
+    fig.update_layout(
+        title="Logit Lens — Top-1 Prediction Diff per Layer",
+        height=max(400, 50 + len(layers) * 28),
+    )
+    return fig
 
 
 def format_diff_info(diff_result: dict) -> str:

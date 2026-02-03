@@ -4,8 +4,14 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 from matplotlib.patches import Patch
+import plotly.graph_objects as go
 
 from src.extraction.causal_intervention import MIN_RECOVERY_DENOMINATOR
+
+
+# ── Color scheme ─────────────────────────────────────────────────────────────
+MAMBA_COLOR = "#ab47bc"
+TRANSFORMER_COLOR = "#26a69a"
 
 
 def create_layer_sweep_dashboard(sweep_result, arch_map) -> plt.Figure:
@@ -243,6 +249,189 @@ def _plot_baselines_summary(ax, sweep_result):
         transform=ax.transAxes, fontsize=9, fontfamily="monospace",
         verticalalignment="top",
     )
+
+
+def _empty_plotly(message: str) -> go.Figure:
+    """Return a Plotly figure with centered instructional text."""
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message, xref="paper", yref="paper", x=0.5, y=0.5,
+        showarrow=False, font=dict(size=14, color="gray"),
+    )
+    fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
+
+
+def create_position_layer_heatmap_plotly(sweep_result, arch_map):
+    """Interactive 2D heatmap of recovery scores (position × layer) with hover."""
+    if sweep_result is None:
+        return _empty_plotly("No intervention results available.")
+
+    matrix = sweep_result.recovery_matrix.numpy()
+    if matrix.ndim == 1:
+        return _empty_plotly("Layer sweep data — use Full Position × Layer Sweep for this view.")
+
+    tokens = sweep_result.corrupted_tokens
+    layers = sweep_result.layer_indices
+    truncated = [_truncate_token(t) for t in tokens]
+
+    layer_labels = []
+    for idx in layers:
+        lt = arch_map.layer_type(idx)
+        marker = "M" if lt == "mamba" else "T"
+        layer_labels.append(f"{idx} ({marker})")
+
+    # Hover text
+    hover = []
+    for li, layer_idx in enumerate(layers):
+        row = []
+        for pi, tok in enumerate(truncated):
+            row.append(f"Layer {layer_idx}, pos {pi} ({tok}): {matrix[li, pi]:+.3f}")
+        hover.append(row)
+
+    vmin = min(float(matrix.min()), -0.1)
+    vmax = max(float(matrix.max()), 0.1)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=matrix, x=truncated, y=layer_labels,
+        colorscale="RdBu_r", zmid=0, zmin=vmin, zmax=vmax,
+        hovertext=hover, hoverinfo="text",
+        colorbar=dict(title="Recovery"),
+    ))
+
+    fig.update_layout(
+        title=f"Recovery Heatmap — {sweep_result.intervention_type.value}",
+        xaxis_title="Token Position",
+        yaxis_title="Layer",
+        height=600, width=800,
+    )
+    return fig
+
+
+def create_layer_marginal_plotly(sweep_result, arch_map):
+    """Horizontal bar chart of per-layer mean recovery, marginalized over positions."""
+    if sweep_result is None:
+        return _empty_plotly("No intervention results available.")
+
+    matrix = sweep_result.recovery_matrix.numpy()
+    if matrix.ndim == 1:
+        return _empty_plotly("Layer sweep data — use Full Position × Layer Sweep for this view.")
+
+    layer_means = matrix.mean(axis=1)
+    layers = sweep_result.layer_indices
+
+    colors = [
+        MAMBA_COLOR if arch_map.layer_type(idx) == "mamba" else TRANSFORMER_COLOR
+        for idx in layers
+    ]
+    labels = [str(idx) for idx in layers]
+    hover = [
+        f"Layer {idx} ({arch_map.layer_type(idx)}): {layer_means[i]:+.3f}"
+        for i, idx in enumerate(layers)
+    ]
+
+    fig = go.Figure(go.Bar(
+        y=labels, x=layer_means,
+        orientation="h",
+        marker_color=colors,
+        hovertext=hover, hoverinfo="text",
+    ))
+
+    fig.add_vline(x=0, line=dict(color="gray", width=1))
+
+    fig.update_layout(
+        title="Per-Layer Mean Recovery",
+        xaxis_title="Mean Recovery",
+        yaxis_title="Layer",
+        yaxis=dict(autorange="reversed"),
+        height=600,
+    )
+    return fig
+
+
+def create_position_marginal_plotly(sweep_result):
+    """Vertical bar chart of per-position mean recovery, marginalized over layers."""
+    if sweep_result is None:
+        return _empty_plotly("No intervention results available.")
+
+    matrix = sweep_result.recovery_matrix.numpy()
+    if matrix.ndim == 1:
+        return _empty_plotly("Layer sweep data — use Full Position × Layer Sweep for this view.")
+
+    pos_means = matrix.mean(axis=0)
+    tokens = sweep_result.corrupted_tokens
+    truncated = [_truncate_token(t) for t in tokens]
+    hover = [
+        f"Pos {i} ({truncated[i]}): {pos_means[i]:+.3f}" for i in range(len(pos_means))
+    ]
+
+    fig = go.Figure(go.Bar(
+        x=truncated, y=pos_means,
+        marker_color="#64b5f6",
+        hovertext=hover, hoverinfo="text",
+    ))
+
+    fig.add_hline(y=0, line=dict(color="gray", width=1))
+
+    fig.update_layout(
+        title="Per-Position Mean Recovery",
+        xaxis_title="Token Position",
+        yaxis_title="Mean Recovery",
+        height=500,
+    )
+    return fig
+
+
+def create_intervention_summary_markdown(sweep_result):
+    """Markdown string with baselines and top results for the summary tab."""
+    if sweep_result is None:
+        return "No intervention results available."
+
+    lines = [
+        f"**Intervention type:** {sweep_result.intervention_type.value}",
+        "",
+        f"**Correct token:** {sweep_result.correct_token_display}",
+        f"**Incorrect token:** {sweep_result.incorrect_token_display}",
+        "",
+        f"| Metric | Clean | Corrupted |",
+        f"|--------|-------|-----------|",
+        f"| Logit diff | {sweep_result.clean_logit_diff:+.3f} | {sweep_result.corrupted_logit_diff:+.3f} |",
+        f"| P(correct) | {sweep_result.clean_prob_correct:.4f} | {sweep_result.corrupted_prob_correct:.4f} |",
+        "",
+    ]
+
+    # Baseline quality warnings
+    denominator = sweep_result.clean_logit_diff - sweep_result.corrupted_logit_diff
+    if abs(denominator) <= MIN_RECOVERY_DENOMINATOR:
+        lines.append(
+            "> **WARNING:** Clean and corrupted logit diffs are nearly identical "
+            f"(denominator={denominator:+.2e}). Recovery scores are meaningless."
+        )
+        lines.append("")
+    elif sweep_result.clean_logit_diff < 0:
+        lines.append(
+            "> **WARNING:** Clean logit diff is NEGATIVE — the model already prefers "
+            f"the 'incorrect' token on the clean prompt (diff={sweep_result.clean_logit_diff:+.3f})."
+        )
+        lines.append("")
+
+    recovery = sweep_result.recovery_matrix.numpy()
+    if recovery.ndim > 1:
+        flat = recovery.flatten()
+        top_k = min(10, len(flat))
+        top_flat_idx = np.argsort(flat)[::-1][:top_k]
+        lines.append("### Top (layer, position) by recovery")
+        lines.append("")
+        lines.append("| Rank | Layer | Position | Token | Recovery |")
+        lines.append("|------|-------|----------|-------|----------|")
+        for rank, fi in enumerate(top_flat_idx, 1):
+            li = fi // recovery.shape[1]
+            pi = fi % recovery.shape[1]
+            layer = sweep_result.layer_indices[li]
+            token = sweep_result.corrupted_tokens[pi] if pi < len(sweep_result.corrupted_tokens) else f"pos{pi}"
+            lines.append(f"| {rank} | {layer} | {pi} | {_truncate_token(token)} | {flat[fi]:+.3f} |")
+
+    return "\n".join(lines)
 
 
 def format_intervention_info(sweep_result) -> str:
