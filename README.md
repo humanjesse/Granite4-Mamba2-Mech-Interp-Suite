@@ -14,6 +14,8 @@ suggested_hardware: cpu-basic
 
 The first interpretability tool for IBM Granite 4.0's hybrid Mamba-2/Transformer architecture. Extracts "hidden attention" matrices from Mamba-2 layers — making the black-box SSM layers as interpretable as standard Transformer attention.
 
+Experiment synopsis @ EXPERIMENTS.MD
+
 ## What This Does
 
 Granite 4.0 uses a **hybrid architecture**: 28 Mamba-2 layers + 4 Transformer attention layers (32 total). Transformer attention is well-understood (softmax over Q·K^T), but Mamba-2 layers are opaque — there's no explicit attention matrix.
