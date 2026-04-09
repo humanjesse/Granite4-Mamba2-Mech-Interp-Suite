@@ -113,6 +113,12 @@ python -m pytest tests/ -v
 
 Developed on AMD Radeon 8060S (Strix Halo, gfx1151) with ROCm 7.1.1 and 48GB unified memory. Uses `HSA_OVERRIDE_GFX_VERSION=11.0.0` for compatibility.
 
+## Activation Steering Experiments
+
+The `sae-steering-experiments` branch contains our attempts to steer Granite 4.0 toward generating bee-related content, inspired by Anthropic's "Golden Gate Claude." We trained Sparse Autoencoders, found monosemantic "bee features" with up to 34,774x selectivity, and then tried to use them to steer the model. **SAE-based steering failed completely** across every configuration -- zero bee keywords from hundreds of generations. What worked instead was contrastive mean-difference vectors injected at early Mamba layers (Layer 1, coefficient 20.0 -- 602 bee keywords).
+
+The key finding: **feature selectivity does not equal causal influence** in hybrid architectures. See [EXPERIMENTS.md](EXPERIMENTS.md) for full methodology and results.
+
 ## Model
 
 - [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) (Apache 2.0)
