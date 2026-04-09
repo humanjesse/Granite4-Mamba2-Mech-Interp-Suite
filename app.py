@@ -49,6 +49,27 @@ from src.visualization.circuit_viz import (
     create_component_importance_plotly,
     create_circuit_summary_markdown,
 )
+from src.storage.result_store import ResultStore
+from src.sae.sparse_autoencoder import SparseAutoencoder
+from src.sae.trainer import SAETrainingConfig, collect_activations, train_sae
+from src.sae.feature_search import (
+    search_features, get_default_bee_texts, get_default_baseline_texts,
+)
+from src.extraction.activation_steering import generate_comparison as steering_generate_comparison
+from src.visualization.steering_viz import (
+    create_training_loss_plotly,
+    create_feature_density_plotly,
+    create_training_summary_markdown,
+    create_feature_search_plotly,
+    create_feature_activations_plotly,
+    create_feature_search_summary_markdown,
+    create_steered_comparison_plotly,
+    create_steering_top5_plotly,
+    create_steering_summary_markdown,
+    format_training_info,
+    format_feature_search_info,
+    format_steering_info,
+)
 
 # Global state
 MODEL = None
@@ -63,11 +84,19 @@ INTERVENTION_CACHE_MAX = 20
 CIRCUIT_ENGINE = None
 CIRCUIT_CACHE = {}
 CIRCUIT_CACHE_MAX = 10
+LAST_INTERVENTION_RESULT = None
+LAST_CIRCUIT_RESULT = None
+RESULT_STORE = None
+SAE_MODEL = None
+SAE_TRAINING_RESULT = None
+SAE_FEATURE_SEARCH_RESULT = None
+SAE_STEERING_RESULT = None
+SAE_LAYER_IDX = 16  # Track which layer the SAE was trained on
 
 
 def initialize():
     """Load model and set up extractor."""
-    global MODEL, TOKENIZER, EXTRACTOR, ARCH_MAP, INTERVENTION_ENGINE, CIRCUIT_ENGINE
+    global MODEL, TOKENIZER, EXTRACTOR, ARCH_MAP, INTERVENTION_ENGINE, CIRCUIT_ENGINE, RESULT_STORE
 
     # Use CPU by default — .to(cuda) hangs intermittently on gfx1151.
     # 350M model runs fine on CPU. Set DEVICE=cuda to force GPU.
@@ -78,6 +107,7 @@ def initialize():
     EXTRACTOR = GraniteAttentionExtractor(MODEL, TOKENIZER, device=device)
     INTERVENTION_ENGINE = CausalInterventionEngine(MODEL, TOKENIZER, ARCH_MAP, device=device)
     CIRCUIT_ENGINE = CircuitDiscoveryEngine(MODEL, TOKENIZER, ARCH_MAP, device=device)
+    RESULT_STORE = ResultStore()
     print(f"Model loaded. {ARCH_MAP.summary()}")
 
 
@@ -458,7 +488,7 @@ SSM layers interpretable alongside standard Transformer attention.
                 )
 
                 view_mode = gr.Radio(
-                    choices=["Single Layer", "Mamba vs Transformer", "All Layers", "Logit Lens", "Neuron Activation", "Activation Diff", "Causal Intervention", "Circuit Discovery", "Multi-Step Generation"],
+                    choices=["Single Layer", "Mamba vs Transformer", "All Layers", "Logit Lens", "Neuron Activation", "Activation Diff", "Causal Intervention", "Circuit Discovery", "Multi-Step Generation", "SAE Training", "Feature Browser", "Activation Steering"],
                     value="Single Layer",
                     label="View Mode",
                 )
@@ -552,6 +582,81 @@ SSM layers interpretable alongside standard Transformer attention.
                     visible=False,
                 )
 
+                # Experiment storage controls
+                save_notes_input = gr.Textbox(
+                    label="Notes",
+                    placeholder="Describe what you're testing...",
+                    lines=2,
+                    visible=False,
+                )
+                save_btn = gr.Button("Save Results", variant="secondary", visible=False)
+                save_status = gr.Textbox(label="Save Status", interactive=False, visible=False)
+                load_dropdown = gr.Dropdown(
+                    label="Load Saved Experiment",
+                    choices=[],
+                    interactive=True,
+                    visible=False,
+                )
+                load_btn = gr.Button("Load", variant="secondary", visible=False)
+
+                # ── SAE Training controls ──
+                sae_layer_slider = gr.Slider(
+                    minimum=0, maximum=num_layers - 1, step=1, value=16,
+                    label="SAE Target Layer",
+                    info="Which layer's residual stream to train the SAE on",
+                    visible=False,
+                )
+                sae_expansion_slider = gr.Slider(
+                    minimum=2, maximum=16, step=1, value=8,
+                    label="Expansion Factor",
+                    info="Latent dim = expansion_factor × hidden_size",
+                    visible=False,
+                )
+                sae_num_activations_slider = gr.Slider(
+                    minimum=10000, maximum=500000, step=10000, value=50000,
+                    label="Training Activations",
+                    info="Number of activation vectors to collect from model",
+                    visible=False,
+                )
+                sae_l1_slider = gr.Slider(
+                    minimum=1e-5, maximum=1e-1, step=1e-5, value=1e-3,
+                    label="L1 Coefficient",
+                    info="Sparsity penalty weight",
+                    visible=False,
+                )
+                sae_train_btn = gr.Button("Train SAE", variant="primary", visible=False)
+                sae_train_status = gr.Textbox(label="Training Status", interactive=False, visible=False)
+
+                # ── Feature Browser controls ──
+                feature_concept_input = gr.Textbox(
+                    label="Concept Texts (one per line, blank = default bee texts)",
+                    placeholder="Honeybees are essential pollinators...\nThe queen bee lays eggs...",
+                    lines=3,
+                    visible=False,
+                )
+                feature_search_btn = gr.Button("Search Features", variant="primary", visible=False)
+
+                # ── Activation Steering controls ──
+                steering_feature_slider = gr.Slider(
+                    minimum=0, maximum=6143, step=1, value=0,
+                    label="Steering Feature Index",
+                    info="SAE feature to steer with (use Feature Browser to find best one)",
+                    visible=False,
+                )
+                steering_coefficient_slider = gr.Slider(
+                    minimum=0.0, maximum=50.0, step=0.5, value=10.0,
+                    label="Steering Coefficient",
+                    info="How strongly to steer (5-20 typical sweet spot)",
+                    visible=False,
+                )
+                steering_max_tokens_slider = gr.Slider(
+                    minimum=5, maximum=100, step=5, value=50,
+                    label="Max Tokens to Generate",
+                    info="Maximum tokens for steered generation",
+                    visible=False,
+                )
+                steer_btn = gr.Button("Generate with Steering", variant="primary", visible=False)
+
                 # Update token resolution display when tokens are typed
                 def update_token_info(correct_text, incorrect_text):
                     if INTERVENTION_ENGINE is None:
@@ -632,6 +737,33 @@ SSM layers interpretable alongside standard Transformer attention.
                         with gr.Tab("Transformer Attention"):
                             multistep_transformer_plot = gr.Plot(label="Transformer Attention")
 
+                with gr.Column(visible=False) as sae_training_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Training Loss"):
+                            sae_loss_plot = gr.Plot(label="Training Loss Curves")
+                        with gr.Tab("Feature Density"):
+                            sae_density_plot = gr.Plot(label="Feature Activation Density")
+                        with gr.Tab("Summary"):
+                            sae_training_summary_md = gr.Markdown("Train an SAE to see results.")
+
+                with gr.Column(visible=False) as feature_browser_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Feature Ranking"):
+                            feature_ranking_plot = gr.Plot(label="Top Features by Selectivity")
+                        with gr.Tab("Feature Activations"):
+                            feature_activations_plot = gr.Plot(label="Per-Text Feature Activations")
+                        with gr.Tab("Summary"):
+                            feature_search_summary_md = gr.Markdown("Search for features to see results.")
+
+                with gr.Column(visible=False) as steering_output_wrapper:
+                    with gr.Tabs():
+                        with gr.Tab("Comparison"):
+                            steering_comparison_plot = gr.Plot(label="Steered vs Unsteered Generation")
+                        with gr.Tab("Top-5 Predictions"):
+                            steering_top5_plot = gr.Plot(label="Per-Token Top Predictions")
+                        with gr.Tab("Summary"):
+                            steering_summary_md = gr.Markdown("Run steering to see results.")
+
                 output_info = gr.Textbox(label="Info", interactive=False, lines=4)
 
         # Update layer type label when slider changes
@@ -647,9 +779,21 @@ SSM layers interpretable alongside standard Transformer attention.
             is_intervention = (mode == "Causal Intervention")
             is_circuit = (mode == "Circuit Discovery")
             is_diff = (mode == "Activation Diff")
+            is_sae_training = (mode == "SAE Training")
+            is_feature_browser = (mode == "Feature Browser")
+            is_steering = (mode == "Activation Steering")
             needs_tokens = is_intervention or is_circuit
-            # single_plot_wrapper: visible when NOT circuit/diff/intervention/multistep
-            show_single = not (is_circuit or is_diff or is_intervention or is_multistep)
+            show_storage = is_intervention or is_circuit
+            tabbed_modes = (is_circuit or is_diff or is_intervention or is_multistep
+                            or is_sae_training or is_feature_browser or is_steering)
+            show_single = not tabbed_modes
+
+            # Refresh load dropdown when switching to a storage-enabled mode
+            load_choices = []
+            if show_storage and RESULT_STORE is not None:
+                exps = RESULT_STORE.list_experiments()
+                load_choices = [e["short_label"] for e in exps]
+
             return (
                 gr.update(visible=is_multistep),     # max_tokens_slider
                 gr.update(visible=is_multistep),     # step_nav_slider
@@ -665,6 +809,29 @@ SSM layers interpretable alongside standard Transformer attention.
                 gr.update(visible=is_diff),          # diff_output_wrapper
                 gr.update(visible=is_intervention),  # intervention_output_wrapper
                 gr.update(visible=is_multistep),     # multistep_output_wrapper
+                gr.update(visible=is_sae_training),  # sae_training_output_wrapper
+                gr.update(visible=is_feature_browser),  # feature_browser_output_wrapper
+                gr.update(visible=is_steering),      # steering_output_wrapper
+                gr.update(visible=show_storage),     # save_notes_input
+                gr.update(visible=show_storage),     # save_btn
+                gr.update(visible=show_storage),     # save_status
+                gr.update(visible=show_storage, choices=load_choices, value=None),  # load_dropdown
+                gr.update(visible=show_storage),     # load_btn
+                # SAE Training controls
+                gr.update(visible=is_sae_training),  # sae_layer_slider
+                gr.update(visible=is_sae_training),  # sae_expansion_slider
+                gr.update(visible=is_sae_training),  # sae_num_activations_slider
+                gr.update(visible=is_sae_training),  # sae_l1_slider
+                gr.update(visible=is_sae_training),  # sae_train_btn
+                gr.update(visible=is_sae_training),  # sae_train_status
+                # Feature Browser controls
+                gr.update(visible=is_feature_browser),  # feature_concept_input
+                gr.update(visible=is_feature_browser),  # feature_search_btn
+                # Activation Steering controls
+                gr.update(visible=is_steering),      # steering_feature_slider
+                gr.update(visible=is_steering),      # steering_coefficient_slider
+                gr.update(visible=is_steering),      # steering_max_tokens_slider
+                gr.update(visible=is_steering),      # steer_btn
             )
 
         view_mode.change(
@@ -678,6 +845,19 @@ SSM layers interpretable alongside standard Transformer attention.
                 single_plot_wrapper, circuit_output_wrapper,
                 diff_output_wrapper, intervention_output_wrapper,
                 multistep_output_wrapper,
+                sae_training_output_wrapper, feature_browser_output_wrapper,
+                steering_output_wrapper,
+                save_notes_input, save_btn, save_status,
+                load_dropdown, load_btn,
+                # SAE Training controls
+                sae_layer_slider, sae_expansion_slider,
+                sae_num_activations_slider, sae_l1_slider,
+                sae_train_btn, sae_train_status,
+                # Feature Browser controls
+                feature_concept_input, feature_search_btn,
+                # Steering controls
+                steering_feature_slider, steering_coefficient_slider,
+                steering_max_tokens_slider, steer_btn,
             ],
         )
 
@@ -715,6 +895,27 @@ SSM layers interpretable alongside standard Transformer attention.
                 gr.update(),               # multistep_transformer_plot
             )
 
+        def _default_sae_training_outputs():
+            return (
+                gr.update(),               # sae_loss_plot
+                gr.update(),               # sae_density_plot
+                gr.update(),               # sae_training_summary_md
+            )
+
+        def _default_feature_browser_outputs():
+            return (
+                gr.update(),               # feature_ranking_plot
+                gr.update(),               # feature_activations_plot
+                gr.update(),               # feature_search_summary_md
+            )
+
+        def _default_steering_outputs():
+            return (
+                gr.update(),               # steering_comparison_plot
+                gr.update(),               # steering_top5_plot
+                gr.update(),               # steering_summary_md
+            )
+
         # Main analysis function
         def analyze(prompt, prompt_b, view_mode, layer_idx, head_agg, max_tokens, step_idx,
                     correct_token, incorrect_token, intervention_type, sweep_mode,
@@ -725,7 +926,8 @@ SSM layers interpretable alongside standard Transformer attention.
             def _make_return(plot, info, slider_upd, vis_mode, **tab_overrides):
                 """Build the full return tuple.
 
-                vis_mode: one of "single", "circuit", "diff", "intervention", "multistep"
+                vis_mode: one of "single", "circuit", "diff", "intervention", "multistep",
+                          "sae_training", "feature_browser", "steering"
                 tab_overrides: dict of group -> tuple, e.g. circuit=(p,l,d,c,s)
                 """
                 wrappers = (
@@ -734,14 +936,20 @@ SSM layers interpretable alongside standard Transformer attention.
                     gr.update(visible=(vis_mode == "diff")),
                     gr.update(visible=(vis_mode == "intervention")),
                     gr.update(visible=(vis_mode == "multistep")),
+                    gr.update(visible=(vis_mode == "sae_training")),
+                    gr.update(visible=(vis_mode == "feature_browser")),
+                    gr.update(visible=(vis_mode == "steering")),
                 )
 
                 circuit = tab_overrides.get("circuit", _default_circuit_outputs())
                 diff = tab_overrides.get("diff", _default_diff_outputs())
                 intervention = tab_overrides.get("intervention", _default_intervention_outputs())
                 multistep = tab_overrides.get("multistep", _default_multistep_outputs())
+                sae_training = tab_overrides.get("sae_training", _default_sae_training_outputs())
+                feature_browser = tab_overrides.get("feature_browser", _default_feature_browser_outputs())
+                steering = tab_overrides.get("steering", _default_steering_outputs())
 
-                return (plot, info, slider_upd) + wrappers + circuit + diff + intervention + multistep
+                return (plot, info, slider_upd) + wrappers + circuit + diff + intervention + multistep + sae_training + feature_browser + steering
 
             if not prompt or not prompt.strip():
                 return _make_return(None, "Please enter a prompt.", gr.update(), "single")
@@ -751,11 +959,13 @@ SSM layers interpretable alongside standard Transformer attention.
                     def cd_progress(step, total):
                         progress(step / total, desc=f"Circuit discovery: {step}/{total}")
 
+                    global LAST_CIRCUIT_RESULT
                     circuit_result, info = circuit_discovery_view(
                         prompt, prompt_b, correct_token, incorrect_token,
                         circuit_threshold, circuit_granularity,
                         progress_callback=cd_progress,
                     )
+                    LAST_CIRCUIT_RESULT = circuit_result
 
                     path_fig = create_path_matrix_plotly(circuit_result, ARCH_MAP)
                     layer_fig = create_layer_importance_plotly(circuit_result, ARCH_MAP)
@@ -788,6 +998,7 @@ SSM layers interpretable alongside standard Transformer attention.
                     )
 
                 if view_mode == "Causal Intervention":
+                    global LAST_INTERVENTION_RESULT
                     def iv_progress(step, total):
                         progress(step / total, desc=f"Intervention sweep: {step}/{total}")
 
@@ -804,6 +1015,7 @@ SSM layers interpretable alongside standard Transformer attention.
                         intervention_type, sweep_mode,
                     )
                     sweep_result = INTERVENTION_CACHE.get(cache_key)
+                    LAST_INTERVENTION_RESULT = sweep_result
                     is_full = (sweep_result is not None
                                and sweep_result.recovery_matrix.dim() == 2)
 
@@ -840,6 +1052,46 @@ SSM layers interpretable alongside standard Transformer attention.
                         ),
                     )
 
+                if view_mode == "SAE Training":
+                    if SAE_TRAINING_RESULT is None:
+                        return _make_return(None, "No SAE trained yet. Configure settings and click 'Train SAE'.", gr.update(), "sae_training")
+                    return _make_return(
+                        gr.update(), format_training_info(SAE_TRAINING_RESULT), gr.update(), "sae_training",
+                        sae_training=(
+                            create_training_loss_plotly(SAE_TRAINING_RESULT),
+                            create_feature_density_plotly(SAE_TRAINING_RESULT),
+                            create_training_summary_markdown(SAE_TRAINING_RESULT),
+                        ),
+                    )
+
+                if view_mode == "Feature Browser":
+                    if SAE_MODEL is None:
+                        return _make_return(None, "Train an SAE first, then search for features.", gr.update(), "feature_browser")
+                    if SAE_FEATURE_SEARCH_RESULT is None:
+                        return _make_return(None, "Click 'Search Features' to find concept-specific features.", gr.update(), "feature_browser")
+                    return _make_return(
+                        gr.update(), format_feature_search_info(SAE_FEATURE_SEARCH_RESULT), gr.update(), "feature_browser",
+                        feature_browser=(
+                            create_feature_search_plotly(SAE_FEATURE_SEARCH_RESULT),
+                            create_feature_activations_plotly(SAE_FEATURE_SEARCH_RESULT, 0),
+                            create_feature_search_summary_markdown(SAE_FEATURE_SEARCH_RESULT),
+                        ),
+                    )
+
+                if view_mode == "Activation Steering":
+                    if SAE_MODEL is None:
+                        return _make_return(None, "Train an SAE first, then use steering.", gr.update(), "steering")
+                    if SAE_STEERING_RESULT is None:
+                        return _make_return(None, "Enter a prompt and click 'Generate with Steering'.", gr.update(), "steering")
+                    return _make_return(
+                        gr.update(), format_steering_info(SAE_STEERING_RESULT), gr.update(), "steering",
+                        steering=(
+                            create_steered_comparison_plotly(SAE_STEERING_RESULT),
+                            create_steering_top5_plotly(SAE_STEERING_RESULT),
+                            create_steering_summary_markdown(SAE_STEERING_RESULT),
+                        ),
+                    )
+
                 # All other views — single plot
                 if view_mode == "Single Layer":
                     fig, info = single_layer_view(prompt, layer_idx, head_agg)
@@ -865,10 +1117,12 @@ SSM layers interpretable alongside standard Transformer attention.
                       circuit_threshold_slider, circuit_granularity_radio]
         all_outputs = [
             output_plot, output_info, step_nav_slider,
-            # 5 wrapper visibilities
+            # 8 wrapper visibilities
             single_plot_wrapper, circuit_output_wrapper,
             diff_output_wrapper, intervention_output_wrapper,
             multistep_output_wrapper,
+            sae_training_output_wrapper, feature_browser_output_wrapper,
+            steering_output_wrapper,
             # Circuit tabs (5)
             circuit_path_plot, circuit_layer_plot,
             circuit_diagram_plot, circuit_component_plot,
@@ -882,6 +1136,12 @@ SSM layers interpretable alongside standard Transformer attention.
             # Multistep tabs (4)
             multistep_timeline_plot, multistep_logit_plot,
             multistep_mamba_plot, multistep_transformer_plot,
+            # SAE Training tabs (3)
+            sae_loss_plot, sae_density_plot, sae_training_summary_md,
+            # Feature Browser tabs (3)
+            feature_ranking_plot, feature_activations_plot, feature_search_summary_md,
+            # Steering tabs (3)
+            steering_comparison_plot, steering_top5_plot, steering_summary_md,
         ]
 
         analyze_btn.click(fn=analyze, inputs=all_inputs, outputs=all_outputs)
@@ -891,10 +1151,9 @@ SSM layers interpretable alongside standard Transformer attention.
 
         # Step slider navigates between cached steps without re-generating
         def on_step_change(prompt, max_tokens, step_idx, head_agg, current_mode):
-            # Must return same shape as all_outputs minus the first 3 (plot, info, slider)
-            # plus the first 2 (plot, info). Total = 2 + (len(all_outputs) - 3) padding
-            n_tab_slots = 5 + 4 + 4 + 4  # circuit + diff + intervention + multistep
-            n_wrappers = 5
+            # Must return same shape as step_nav_outputs
+            n_tab_slots = 5 + 4 + 4 + 4 + 3 + 3 + 3  # circuit+diff+intervention+multistep+sae+feature+steering
+            n_wrappers = 8
             no_change = (gr.update(), gr.update()) + tuple(gr.update() for _ in range(n_wrappers + n_tab_slots))
             if current_mode != "Multi-Step Generation":
                 return no_change
@@ -913,20 +1172,23 @@ SSM layers interpretable alongside standard Transformer attention.
             mamba_fig = create_mamba_attention_plotly(step_data, ARCH_MAP, head_agg)
             transformer_fig = create_transformer_attention_plotly(step_data, ARCH_MAP, head_agg)
 
-            # Return: output_plot (unused), output_info, 5 wrappers (no change),
+            # Return: output_plot (unused), output_info, 8 wrappers (no change),
             # circuit(5) no change, diff(4) no change, intervention(4) no change,
-            # multistep(4) updated
-            padding = tuple(gr.update() for _ in range(n_wrappers + 5 + 4 + 4))
+            # multistep(4) updated, sae(3)+feature(3)+steering(3) no change
+            padding_before = tuple(gr.update() for _ in range(n_wrappers + 5 + 4 + 4))
+            padding_after = tuple(gr.update() for _ in range(3 + 3 + 3))
             return (
                 gr.update(),  # output_plot
                 info,         # output_info
-            ) + padding + (timeline_fig, logit_fig, mamba_fig, transformer_fig)
+            ) + padding_before + (timeline_fig, logit_fig, mamba_fig, transformer_fig) + padding_after
 
         step_nav_outputs = [
             output_plot, output_info,
             single_plot_wrapper, circuit_output_wrapper,
             diff_output_wrapper, intervention_output_wrapper,
             multistep_output_wrapper,
+            sae_training_output_wrapper, feature_browser_output_wrapper,
+            steering_output_wrapper,
             circuit_path_plot, circuit_layer_plot,
             circuit_diagram_plot, circuit_component_plot,
             circuit_summary_md,
@@ -936,12 +1198,266 @@ SSM layers interpretable alongside standard Transformer attention.
             intervention_position_plot, intervention_summary_md,
             multistep_timeline_plot, multistep_logit_plot,
             multistep_mamba_plot, multistep_transformer_plot,
+            sae_loss_plot, sae_density_plot, sae_training_summary_md,
+            feature_ranking_plot, feature_activations_plot, feature_search_summary_md,
+            steering_comparison_plot, steering_top5_plot, steering_summary_md,
         ]
 
         step_nav_slider.release(
             fn=on_step_change,
             inputs=[prompt_input, max_tokens_slider, step_nav_slider, head_agg, view_mode],
             outputs=step_nav_outputs,
+        )
+
+        # ── Save / Load handlers ───────────────────────────────────────
+
+        def on_save_click(current_view_mode, notes):
+            if RESULT_STORE is None:
+                return "Storage not initialized.", gr.update()
+            try:
+                if current_view_mode == "Causal Intervention":
+                    if LAST_INTERVENTION_RESULT is None:
+                        return "No intervention results to save. Run an experiment first.", gr.update()
+                    save_dir = RESULT_STORE.save_intervention(LAST_INTERVENTION_RESULT, notes=notes)
+                    status = f"Saved to {save_dir.name}"
+                elif current_view_mode == "Circuit Discovery":
+                    if LAST_CIRCUIT_RESULT is None:
+                        return "No circuit results to save. Run an experiment first.", gr.update()
+                    save_dir = RESULT_STORE.save_circuit(LAST_CIRCUIT_RESULT, notes=notes)
+                    status = f"Saved to {save_dir.name}"
+                else:
+                    return "Save is only available for Causal Intervention and Circuit Discovery.", gr.update()
+                # Refresh dropdown
+                exps = RESULT_STORE.list_experiments()
+                choices = [e["short_label"] for e in exps]
+                return status, gr.update(choices=choices, value=None)
+            except Exception as e:
+                return f"Save failed: {e}", gr.update()
+
+        save_btn.click(
+            fn=on_save_click,
+            inputs=[view_mode, save_notes_input],
+            outputs=[save_status, load_dropdown],
+        )
+
+        def on_load_click(selected_label):
+            # Build a full return tuple matching load_outputs shape
+            n_wrappers = 8
+            n_tabs = 5 + 4 + 4 + 4 + 3 + 3 + 3  # circuit+diff+intervention+multistep+sae+feature+steering
+            no_change = (gr.update(), gr.update()) + tuple(gr.update() for _ in range(n_wrappers + n_tabs))
+            new_defaults = _default_sae_training_outputs() + _default_feature_browser_outputs() + _default_steering_outputs()
+
+            if not selected_label or RESULT_STORE is None:
+                return (gr.update(), "Select an experiment to load.") + tuple(
+                    gr.update() for _ in range(n_wrappers + n_tabs)
+                )
+
+            exps = RESULT_STORE.list_experiments()
+            match = next((e for e in exps if e["short_label"] == selected_label), None)
+            if match is None:
+                return (gr.update(), f"Experiment not found: {selected_label}") + tuple(
+                    gr.update() for _ in range(n_wrappers + n_tabs)
+                )
+
+            try:
+                if match["tool_type"] == "intervention":
+                    result, meta = RESULT_STORE.load_intervention(match["path"])
+                    notes_line = f"Notes: {meta.get('notes', '(none)')}"
+                    info = f"[LOADED] {format_intervention_info(result)}\n{notes_line}"
+                    is_full = result.recovery_matrix.dim() == 2
+                    wrappers = (
+                        gr.update(visible=not is_full),  # single_plot_wrapper
+                        gr.update(visible=False),        # circuit_output_wrapper
+                        gr.update(visible=False),        # diff_output_wrapper
+                        gr.update(visible=is_full),      # intervention_output_wrapper
+                        gr.update(visible=False),        # multistep_output_wrapper
+                        gr.update(visible=False),        # sae_training_output_wrapper
+                        gr.update(visible=False),        # feature_browser_output_wrapper
+                        gr.update(visible=False),        # steering_output_wrapper
+                    )
+                    if is_full:
+                        intervention = (
+                            create_position_layer_heatmap_plotly(result, ARCH_MAP),
+                            create_layer_marginal_plotly(result, ARCH_MAP),
+                            create_position_marginal_plotly(result),
+                            create_intervention_summary_markdown(result),
+                        )
+                        return (gr.update(), info) + wrappers + _default_circuit_outputs() + _default_diff_outputs() + intervention + _default_multistep_outputs() + new_defaults
+                    else:
+                        fig = create_layer_sweep_dashboard(result, ARCH_MAP)
+                        return (fig, info) + wrappers + _default_circuit_outputs() + _default_diff_outputs() + _default_intervention_outputs() + _default_multistep_outputs() + new_defaults
+
+                elif match["tool_type"] == "circuit":
+                    result, meta = RESULT_STORE.load_circuit(match["path"])
+                    notes_line = f"Notes: {meta.get('notes', '(none)')}"
+                    info = f"[LOADED] {format_circuit_info(result)}\n{notes_line}"
+                    wrappers = (
+                        gr.update(visible=False),  # single_plot_wrapper
+                        gr.update(visible=True),   # circuit_output_wrapper
+                        gr.update(visible=False),  # diff_output_wrapper
+                        gr.update(visible=False),  # intervention_output_wrapper
+                        gr.update(visible=False),  # multistep_output_wrapper
+                        gr.update(visible=False),  # sae_training_output_wrapper
+                        gr.update(visible=False),  # feature_browser_output_wrapper
+                        gr.update(visible=False),  # steering_output_wrapper
+                    )
+                    circuit = (
+                        create_path_matrix_plotly(result, ARCH_MAP),
+                        create_layer_importance_plotly(result, ARCH_MAP),
+                        create_circuit_diagram_plotly(result, ARCH_MAP),
+                        create_component_importance_plotly(result, ARCH_MAP),
+                        create_circuit_summary_markdown(result, ARCH_MAP),
+                    )
+                    return (gr.update(), info) + wrappers + circuit + _default_diff_outputs() + _default_intervention_outputs() + _default_multistep_outputs() + new_defaults
+
+            except Exception as e:
+                return (gr.update(), f"Error loading: {e}") + tuple(
+                    gr.update() for _ in range(n_wrappers + n_tabs)
+                )
+
+            return no_change
+
+        load_outputs = [
+            output_plot, output_info,
+            single_plot_wrapper, circuit_output_wrapper,
+            diff_output_wrapper, intervention_output_wrapper,
+            multistep_output_wrapper,
+            sae_training_output_wrapper, feature_browser_output_wrapper,
+            steering_output_wrapper,
+            circuit_path_plot, circuit_layer_plot,
+            circuit_diagram_plot, circuit_component_plot,
+            circuit_summary_md,
+            diff_residual_plot, diff_attention_plot,
+            diff_neuron_plot, diff_logit_plot,
+            intervention_heatmap_plot, intervention_layer_plot,
+            intervention_position_plot, intervention_summary_md,
+            multistep_timeline_plot, multistep_logit_plot,
+            multistep_mamba_plot, multistep_transformer_plot,
+            sae_loss_plot, sae_density_plot, sae_training_summary_md,
+            feature_ranking_plot, feature_activations_plot, feature_search_summary_md,
+            steering_comparison_plot, steering_top5_plot, steering_summary_md,
+        ]
+
+        load_btn.click(
+            fn=on_load_click,
+            inputs=[load_dropdown],
+            outputs=load_outputs,
+        )
+
+        # ── SAE / Feature / Steering button handlers ─────────────────
+
+        def on_sae_train_click(sae_layer, expansion, num_acts, l1_coeff, progress=gr.Progress(track_tqdm=False)):
+            global SAE_MODEL, SAE_TRAINING_RESULT, SAE_LAYER_IDX
+            if MODEL is None:
+                return "Model not loaded.", gr.update(), gr.update(), gr.update()
+
+            config = SAETrainingConfig(
+                layer_idx=int(sae_layer),
+                expansion_factor=int(expansion),
+                l1_coefficient=float(l1_coeff),
+                num_activations=int(num_acts),
+            )
+
+            progress(0.0, desc="Collecting activations from model...")
+            activations = collect_activations(
+                MODEL, TOKENIZER, config.layer_idx, config.num_activations,
+                device=str(next(MODEL.parameters()).device),
+                progress_callback=lambda c, t: progress(0.4 * c / t, desc=f"Collecting activations: {c}/{t}"),
+            )
+
+            progress(0.4, desc="Training SAE...")
+            result = train_sae(
+                activations, config,
+                progress_callback=lambda s, t: progress(0.4 + 0.6 * s / t, desc=f"Training SAE: step {s}/{t}"),
+            )
+
+            SAE_MODEL = result.sae
+            SAE_TRAINING_RESULT = result
+            SAE_LAYER_IDX = config.layer_idx
+
+            return (
+                format_training_info(result),
+                create_training_loss_plotly(result),
+                create_feature_density_plotly(result),
+                create_training_summary_markdown(result),
+            )
+
+        sae_train_btn.click(
+            fn=on_sae_train_click,
+            inputs=[sae_layer_slider, sae_expansion_slider, sae_num_activations_slider, sae_l1_slider],
+            outputs=[sae_train_status, sae_loss_plot, sae_density_plot, sae_training_summary_md],
+        )
+
+        def on_feature_search_click(concept_text, progress=gr.Progress(track_tqdm=False)):
+            global SAE_FEATURE_SEARCH_RESULT
+            if SAE_MODEL is None:
+                return "Train an SAE first.", gr.update(), gr.update(), gr.update()
+
+            concept_texts = (
+                [t.strip() for t in concept_text.strip().split("\n") if t.strip()]
+                if concept_text and concept_text.strip()
+                else get_default_bee_texts()
+            )
+            baseline_texts = get_default_baseline_texts()
+
+            result = search_features(
+                SAE_MODEL, MODEL, TOKENIZER, SAE_LAYER_IDX,
+                concept_texts, baseline_texts,
+                device=str(next(MODEL.parameters()).device),
+                progress_callback=lambda s, t: progress(s / t, desc=f"Searching features: {s}/{t}"),
+            )
+            SAE_FEATURE_SEARCH_RESULT = result
+
+            # Update steering feature slider to best feature
+            best_idx = result.top_features[0]["feature_idx"] if result.top_features else 0
+
+            return (
+                format_feature_search_info(result),
+                create_feature_search_plotly(result),
+                create_feature_activations_plotly(result, 0),
+                create_feature_search_summary_markdown(result),
+                gr.update(value=best_idx),  # steering_feature_slider
+            )
+
+        feature_search_btn.click(
+            fn=on_feature_search_click,
+            inputs=[feature_concept_input],
+            outputs=[output_info, feature_ranking_plot, feature_activations_plot,
+                     feature_search_summary_md, steering_feature_slider],
+        )
+
+        def on_steer_click(prompt, feature_idx, coefficient, steer_max_tokens, progress=gr.Progress(track_tqdm=False)):
+            global SAE_STEERING_RESULT
+            if SAE_MODEL is None:
+                return "Train an SAE first.", gr.update(), gr.update(), gr.update()
+            if not prompt or not prompt.strip():
+                return "Enter a prompt to steer.", gr.update(), gr.update(), gr.update()
+
+            steering_vector = SAE_MODEL.get_feature_direction(int(feature_idx))
+
+            result = steering_generate_comparison(
+                MODEL, TOKENIZER, prompt.strip(),
+                steering_vector=steering_vector,
+                layer_idx=SAE_LAYER_IDX,
+                coefficient=float(coefficient),
+                max_tokens=int(steer_max_tokens),
+                device=str(next(MODEL.parameters()).device),
+                progress_callback=lambda s, t: progress(s / t, desc=f"Generating: {s}/{t}"),
+            )
+            result.config.feature_idx = int(feature_idx)
+            SAE_STEERING_RESULT = result
+
+            return (
+                format_steering_info(result),
+                create_steered_comparison_plotly(result),
+                create_steering_top5_plotly(result),
+                create_steering_summary_markdown(result),
+            )
+
+        steer_btn.click(
+            fn=on_steer_click,
+            inputs=[prompt_input, steering_feature_slider, steering_coefficient_slider, steering_max_tokens_slider],
+            outputs=[output_info, steering_comparison_plot, steering_top5_plot, steering_summary_md],
         )
 
     return app
